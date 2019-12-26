@@ -159,7 +159,8 @@ class FrontendModule(outer: Frontend) extends LazyModuleImp(outer)
   icache.io.s1_paddr := tlb.io.resp.paddr
   icache.io.s2_vaddr := s2_pc
   icache.io.s1_kill := s2_redirect || tlb.io.resp.miss || s2_replay
-  icache.io.s2_kill := s2_speculative && !s2_tlb_resp.cacheable || s2_xcpt
+  val s2_can_speculatively_refill = s2_tlb_resp.cacheable && !io.ptw.customCSRs.asInstanceOf[RocketCustomCSRs].disableSpeculativeICacheRefill
+  icache.io.s2_kill := s2_speculative && !s2_can_speculatively_refill || s2_xcpt
   icache.io.s2_prefetch := s2_tlb_resp.prefetchable
 
   fq.io.enq.valid := RegNext(s1_valid) && s2_valid && (icache.io.resp.valid || !s2_tlb_resp.miss && icache.io.s2_kill)
@@ -355,7 +356,7 @@ trait HasICacheFrontend extends CanHavePTW { this: BaseTile =>
   // don't actually use the device that is instantiated in the frontend.
   private val deviceOpt = if (tileParams.icache.get.itimAddr.isDefined) Some(frontend.icache.device) else None
 
-  val iCacheLogicalTreeNode = new ICacheLogicalTreeNode(deviceOpt, tileParams.icache.get)
+  val iCacheLogicalTreeNode = new ICacheLogicalTreeNode(frontend.icache, deviceOpt, tileParams.icache.get)
 }
 
 trait HasICacheFrontendModule extends CanHavePTWModule {

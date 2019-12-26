@@ -7,7 +7,7 @@ import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.diplomaticobjectmodel.HasLogicalTreeNode
 import freechips.rocketchip.diplomaticobjectmodel.logicaltree._
-import freechips.rocketchip.diplomaticobjectmodel.model.{OMComponent, OMInterrupt}
+import freechips.rocketchip.tilelink.TLBusWrapper
 import freechips.rocketchip.util._
 
 
@@ -36,18 +36,44 @@ abstract class BareSubsystemModuleImp[+L <: BareSubsystem](_outer: L) extends La
   println(outer.dts)
 }
 
+
+trait HasBusAttachmentFunction {
+  type BusAttachmentFunction = PartialFunction[BaseSubsystemBusAttachment, TLBusWrapper]
+  def attach: BusAttachmentFunction
+}
+
+/** This trait contains the cases matched in baseBusAttachmentFunc below.
+  * Extend/override them to offer novel attachment locations in subclasses of BaseSubsystem.
+  */
+trait BaseSubsystemBusAttachment
+case object SBUS extends BaseSubsystemBusAttachment
+case object PBUS extends BaseSubsystemBusAttachment
+case object FBUS extends BaseSubsystemBusAttachment
+case object MBUS extends BaseSubsystemBusAttachment
+case object CBUS extends BaseSubsystemBusAttachment
+
 /** Base Subsystem class with no peripheral devices or ports added */
-abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem with HasLogicalTreeNode {
+abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem 
+  with HasLogicalTreeNode with HasBusAttachmentFunction {
+
   override val module: BaseSubsystemModuleImp[BaseSubsystem]
 
   // These are wrappers around the standard buses available in all subsytems, where
   // peripherals, tiles, ports, and other masters and slaves can attach themselves.
   val ibus = new InterruptBusWrapper()
   val sbus = LazyModule(p(BuildSystemBus)(p))
-  val pbus = LazyModule(new PeripheryBus(p(PeripheryBusKey)))
+  val pbus = LazyModule(new PeripheryBus(p(PeripheryBusKey), "subsystem_pbus"))
   val fbus = LazyModule(new FrontBus(p(FrontBusKey)))
   val mbus = LazyModule(new MemoryBus(p(MemoryBusKey)))
-  val cbus = LazyModule(new PeripheryBus(p(ControlBusKey)))
+  val cbus = LazyModule(new PeripheryBus(p(ControlBusKey), "subsystem_cbus"))
+
+  def attach: BusAttachmentFunction = {
+    case SBUS => sbus
+    case PBUS => pbus
+    case FBUS => fbus
+    case MBUS => mbus
+    case CBUS => cbus
+  }
 
   // Collect information for use in DTS
   lazy val topManagers = sbus.unifyManagers
@@ -74,7 +100,7 @@ abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem with 
     }
   }
 
-  val logicalTreeNode = new SubSystemLogicalTreeNode()
+  lazy val logicalTreeNode = new SubsystemLogicalTreeNode()
 }
 
 

@@ -3,6 +3,7 @@
 package freechips.rocketchip.diplomacy
 
 import Chisel._
+import chisel3.experimental.IO
 import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.config.{Parameters,Field}
 import freechips.rocketchip.util.HeterogeneousBag
@@ -94,6 +95,7 @@ abstract class BaseNode(implicit val valName: ValName)
   }
 
   def description: String
+  def formatNode: String = ""
 
   def inputs:  Seq[(BaseNode, RenderedEdge)]
   def outputs: Seq[(BaseNode, RenderedEdge)]
@@ -106,6 +108,21 @@ abstract class BaseNode(implicit val valName: ValName)
 object BaseNode
 {
   protected[diplomacy] var serial = 0
+}
+
+trait FormatEdge {
+  def formatEdge: String
+}
+
+trait FormatNode[I <: FormatEdge, O <: FormatEdge] extends BaseNode {
+  def edges: Edges[I,O]
+  override def formatNode = {
+    edges.out.map(currEdge =>
+      "On Output Edge:\n\n" + currEdge.formatEdge).mkString +
+    "\n---------------------------------------------\n\n" +
+    edges.in.map(currEdge =>
+      "On Input Edge:\n\n" + currEdge.formatEdge).mkString
+  }
 }
 
 trait NoHandle
@@ -221,7 +238,7 @@ case class StarCycleException(loop: Seq[String] = Nil) extends CycleException("s
 case class DownwardCycleException(loop: Seq[String] = Nil) extends CycleException("downward", loop)
 case class UpwardCycleException(loop: Seq[String] = Nil) extends CycleException("upward", loop)
 
-case class Edges[EI, EO](in: EI, out: EO)
+case class Edges[EI, EO](in: Seq[EI], out: Seq[EO])
 sealed abstract class MixedNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data](
   val inner: InwardNodeImp [DI, UI, EI, BI],
   val outer: OutwardNodeImp[DO, UO, EO, BO])(
@@ -434,6 +451,64 @@ abstract class CustomNode[D, U, EO, EI, B <: Data](imp: NodeImp[D, U, EO, EI, B]
   implicit valName: ValName)
   extends MixedCustomNode(imp, imp)
 
+class MixedJunctionNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data](
+  inner: InwardNodeImp [DI, UI, EI, BI],
+  outer: OutwardNodeImp[DO, UO, EO, BO])(
+  uRatio: Int,
+  dRatio: Int,
+  dFn: Seq[DI] => Seq[DO],
+  uFn: Seq[UO] => Seq[UI])(
+  implicit valName: ValName)
+  extends MixedNode(inner, outer)
+{
+  require (dRatio >= 1)
+  require (uRatio >= 1)
+
+  override def description = "junction"
+  protected[diplomacy] def resolveStar(iKnown: Int, oKnown: Int, iStars: Int, oStars: Int): (Int, Int) = {
+    require (iStars <= uRatio, s"$context appears left of a :*= $iStars times; at most $uRatio (uRatio) is allowed")
+    require (oStars <= dRatio, s"$context appears right of a :=* $oStars times; at most $dRatio (dRatio) is allowed")
+    val iFixed = uRatio - iStars
+    val oFixed = dRatio - oStars
+    require (oFixed != 0 || iFixed != 0, s"$context has flexible bindings for every in/out ratio; it cannot resolve the cardinality")
+    require (oFixed == 0 || oKnown % oFixed == 0, s"$context is connected to $oKnown fixed outputs, but this must be divisible by the inflexible ratio $oFixed")
+    require (iFixed == 0 || iKnown % iFixed == 0, s"$context is connected to $iKnown fixed inputs, but this must be divisible by the inflexible ratio $iFixed")
+    require (iFixed == 0 || oFixed == 0 || oKnown/oFixed == iKnown/iFixed, s"$context has ${oKnown/oFixed} output multiplicity, which does not equal the ${iKnown/iFixed} input multiplicity")
+    val multiplier = if (iFixed == 0) { oKnown/oFixed } else { iKnown/iFixed }
+    (multiplier, multiplier)
+  }
+  private def wrapDFn(in: Seq[DI]): Seq[DO] = {
+    val out = dFn(in)
+    require (in.size  == uRatio, s"$context has the wrong number of parameters in for dFn (${in.size} != ${uRatio})")
+    require (out.size == dRatio, s"$context has the wrong number of parameters out of dFn (${out.size} != ${dRatio})")
+    out
+  }
+  private def wrapUFn(out: Seq[UO]): Seq[UI] = {
+    val in = uFn(out)
+    require (in.size  == uRatio, s"$context has the wrong number of parameters out of uFn (${in.size} != ${uRatio})")
+    require (out.size == dRatio, s"$context has the wrong number of parameters in for uFn (${out.size} != ${dRatio})")
+    in
+  }
+  protected[diplomacy] def mapParamsD(n: Int, p: Seq[DI]): Seq[DO] =
+    p.grouped(p.size/uRatio).toList.transpose.map(wrapDFn).transpose.flatten
+  protected[diplomacy] def mapParamsU(n: Int, p: Seq[UO]): Seq[UI] =
+    p.grouped(p.size/dRatio).toList.transpose.map(wrapUFn).transpose.flatten
+
+  def inoutGrouped: Seq[(Seq[(BI, EI)], Seq[(BO, EO)])] = {
+    val iGroups = in .grouped(in .size/uRatio).toList.transpose
+    val oGroups = out.grouped(out.size/dRatio).toList.transpose
+    iGroups zip oGroups
+  }
+}
+
+class JunctionNode[D, U, EO, EI, B <: Data](imp: NodeImp[D, U, EO, EI, B])(
+  uRatio: Int,
+  dRatio: Int,
+  dFn: Seq[D] => Seq[D],
+  uFn: Seq[U] => Seq[U])(
+  implicit valName: ValName)
+    extends MixedJunctionNode[D, U, EI, B, D, U, EO, B](imp, imp)(uRatio, dRatio, dFn, uFn)
+
 class MixedAdapterNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data](
   inner: InwardNodeImp [DI, UI, EI, BI],
   outer: OutwardNodeImp[DO, UO, EO, BO])(
@@ -541,6 +616,14 @@ class SourceNode[D, U, EO, EI, B <: Data](imp: NodeImp[D, U, EO, EI, B])(po: Seq
   }
   protected[diplomacy] def mapParamsD(n: Int, p: Seq[D]): Seq[D] = po
   protected[diplomacy] def mapParamsU(n: Int, p: Seq[U]): Seq[U] = Seq()
+
+  def makeIOs()(implicit valName: ValName): HeterogeneousBag[B] = {
+    val bundles = this.out.map(_._1)
+    val ios = IO(Flipped(new HeterogeneousBag(bundles.map(_.cloneType))))
+    ios.suggestName(valName.name)
+    bundles.zip(ios).foreach { case (bundle, io) => bundle <> io }
+    ios
+  }
 }
 
 // There are no Mixed SinkNodes
@@ -558,6 +641,14 @@ class SinkNode[D, U, EO, EI, B <: Data](imp: NodeImp[D, U, EO, EI, B])(pi: Seq[U
   }
   protected[diplomacy] def mapParamsD(n: Int, p: Seq[D]): Seq[D] = Seq()
   protected[diplomacy] def mapParamsU(n: Int, p: Seq[U]): Seq[U] = pi
+
+  def makeIOs()(implicit valName: ValName): HeterogeneousBag[B] = {
+    val bundles = this.in.map(_._1)
+    val ios = IO(new HeterogeneousBag(bundles.map(_.cloneType)))
+    ios.suggestName(valName.name)
+    bundles.zip(ios).foreach { case (bundle, io) => io <> bundle }
+    ios
+  }
 }
 
 class MixedTestNode[DI, UI, EI, BI <: Data, DO, UO, EO, BO <: Data] protected[diplomacy](
