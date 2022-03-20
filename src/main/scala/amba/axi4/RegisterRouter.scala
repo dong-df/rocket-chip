@@ -7,8 +7,10 @@ import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.interrupts.{IntSourceNode, IntSourcePortSimple}
-import freechips.rocketchip.util.{HeterogeneousBag, MaskGen}
-import scala.math.{min,max}
+import freechips.rocketchip.util._
+
+case object AXI4RRId extends ControlKey[UInt]("extra_id")
+case class AXI4RRIdField(width: Int) extends SimpleBundleField(AXI4RRId)(UInt(OUTPUT, width = 1 max width), UInt(0))
 
 case class AXI4RegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes: Int = 4, undefZero: Boolean = true, executable: Boolean = false)(implicit valName: ValName)
   extends SinkNode(AXI4Imp)(Seq(AXI4SlavePortParameters(
@@ -33,8 +35,11 @@ case class AXI4RegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes
     val r  = io.r
     val b  = io.b
 
-    val params = RegMapperParams(log2Up((address.mask+1)/beatBytes), beatBytes, ar.bits.params.idBits + ar.bits.params.userBits)
+    val fields = AXI4RRIdField(ar.bits.params.idBits) +: ar.bits.params.echoFields
+    val params = RegMapperParams(log2Up((address.mask+1)/beatBytes), beatBytes, fields)
     val in = Wire(Decoupled(new RegMapperInput(params)))
+    val ar_extra = Wire(in.bits.extra)
+    val aw_extra = Wire(in.bits.extra)
 
     // Prefer to execute reads first
     in.valid := ar.valid || (aw.valid && w.valid)
@@ -42,9 +47,10 @@ case class AXI4RegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes
     aw.ready := in.ready && !ar.valid && w .valid
     w .ready := in.ready && !ar.valid && aw.valid
 
-    val ar_extra = Cat(Seq(ar.bits.id) ++ ar.bits.user.toList)
-    val aw_extra = Cat(Seq(aw.bits.id) ++ aw.bits.user.toList)
-    val in_extra = Mux(ar.valid, ar_extra, aw_extra)
+    ar_extra :<= ar.bits.echo
+    aw_extra :<= aw.bits.echo
+    ar_extra(AXI4RRId) := ar.bits.id
+    aw_extra(AXI4RRId) := aw.bits.id
     val addr = Mux(ar.valid, ar.bits.addr, aw.bits.addr)
     val mask = MaskGen(ar.bits.addr, ar.bits.size, beatBytes)
 
@@ -52,7 +58,7 @@ case class AXI4RegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes
     in.bits.index := addr >> log2Ceil(beatBytes)
     in.bits.data  := w.bits.data
     in.bits.mask  := Mux(ar.valid, mask, w.bits.strb)
-    in.bits.extra := in_extra
+    in.bits.extra := Mux(ar.valid, ar_extra, aw_extra)
 
     // Invoke the register map builder and make it Irrevocable
     val out = Queue.irrevocable(
@@ -64,38 +70,41 @@ case class AXI4RegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes
     r.valid := out.valid &&  out.bits.read
     b.valid := out.valid && !out.bits.read
 
-    val out_id = if (r.bits.params.idBits == 0) UInt(0) else (out.bits.extra >> ar.bits.params.userBits)
-
-    r.bits.id   := out_id
+    r.bits.id   := out.bits.extra(AXI4RRId)
     r.bits.data := out.bits.data
     r.bits.last := Bool(true)
     r.bits.resp := AXI4Parameters.RESP_OKAY
-    r.bits.user.foreach { _ := out.bits.extra }
+    r.bits.echo :<= out.bits.extra
 
-    b.bits.id   := out_id
+    b.bits.id   := out.bits.extra(AXI4RRId)
     b.bits.resp := AXI4Parameters.RESP_OKAY
-    b.bits.user.foreach { _ := out.bits.extra }
+    b.bits.echo :<= out.bits.extra
   }
 }
 
 // These convenience methods below combine to make it possible to create a AXI4
 // register mapped device from a totally abstract register mapped device.
 
+@deprecated("Use HasAXI4ControlRegMap+HasInterruptSources traits in place of AXI4RegisterRouter+AXI4RegBundle+AXI4RegModule", "rocket-chip 1.3")
 abstract class AXI4RegisterRouterBase(address: AddressSet, interrupts: Int, concurrency: Int, beatBytes: Int, undefZero: Boolean, executable: Boolean)(implicit p: Parameters) extends LazyModule
 {
   val node = AXI4RegisterNode(address, concurrency, beatBytes, undefZero, executable)
   val intnode = IntSourceNode(IntSourcePortSimple(num = interrupts))
 }
 
+@deprecated("AXI4RegBundleArg is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 case class AXI4RegBundleArg()(implicit val p: Parameters)
 
+@deprecated("AXI4RegBundleBase is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 class AXI4RegBundleBase(arg: AXI4RegBundleArg) extends Bundle
 {
   implicit val p = arg.p
 }
 
+@deprecated("Use HasAXI4ControlRegMap+HasInterruptSources traits in place of AXI4RegisterRouter+AXI4RegBundle+AXI4RegModule", "rocket-chip 1.3")
 class AXI4RegBundle[P](val params: P, arg: AXI4RegBundleArg) extends AXI4RegBundleBase(arg)
 
+@deprecated("Use HasAXI4ControlRegMap+HasInterruptSources traits in place of AXI4RegisterRouter+AXI4RegBundle+AXI4RegModule", "rocket-chip 1.3")
 class AXI4RegModule[P, B <: AXI4RegBundleBase](val params: P, bundleBuilder: => B, router: AXI4RegisterRouterBase)
   extends LazyModuleImp(router) with HasRegMap
 {
@@ -104,6 +113,7 @@ class AXI4RegModule[P, B <: AXI4RegBundleBase](val params: P, bundleBuilder: => 
   def regmap(mapping: RegField.Map*) = router.node.regmap(mapping:_*)
 }
 
+@deprecated("Use HasAXI4ControlRegMap+HasInterruptSources traits in place of AXI4RegisterRouter+AXI4RegBundle+AXI4RegModule", "rocket-chip 1.3")
 class AXI4RegisterRouter[B <: AXI4RegBundleBase, M <: LazyModuleImp]
    (val base: BigInt, val interrupts: Int = 0, val size: BigInt = 4096, val concurrency: Int = 0, val beatBytes: Int = 4, undefZero: Boolean = true, executable: Boolean = false)
    (bundleBuilder: AXI4RegBundleArg => B)
@@ -117,7 +127,7 @@ class AXI4RegisterRouter[B <: AXI4RegBundleBase, M <: LazyModuleImp]
 }
 
 /** Mix this trait into a RegisterRouter to be able to attach its register map to an AXI4 bus */
-trait HasAXI4ControlRegMap { this: RegisterRouter[_] =>
+trait HasAXI4ControlRegMap { this: RegisterRouter =>
   protected val controlNode = AXI4RegisterNode(
     address = address.head,
     concurrency = concurrency,
@@ -126,8 +136,11 @@ trait HasAXI4ControlRegMap { this: RegisterRouter[_] =>
     executable = executable)
 
   // Externally, this helper should be used to connect the register control port to a bus
-  val controlXing: AXI4InwardCrossingHelper = this.crossIn(controlNode)
+  val controlXing: AXI4InwardClockCrossingHelper = this.crossIn(controlNode)
+
+  // Backwards-compatibility default node accessor with no clock crossing
+  lazy val node: AXI4InwardNode = controlXing(NoCrossing)
 
   // Internally, this function should be used to populate the control port with registers
-  protected def regmap(mapping: RegField.Map*) { controlNode.regmap(mapping:_*) }
+  protected def regmap(mapping: RegField.Map*): Unit = { controlNode.regmap(mapping:_*) }
 }

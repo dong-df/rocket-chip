@@ -3,7 +3,7 @@
 package freechips.rocketchip.util
 
 import Chisel._
-import chisel3.core.Record
+import chisel3.Record
 import scala.collection.immutable.ListMap
 
 final case class HeterogeneousBag[T <: Data](elts: Seq[T]) extends Record with collection.IndexedSeq[T] {
@@ -12,7 +12,6 @@ final case class HeterogeneousBag[T <: Data](elts: Seq[T]) extends Record with c
 
   val elements = ListMap(elts.zipWithIndex.map { case (n,i) => (i.toString, n) }:_*)
   override def cloneType: this.type = (new HeterogeneousBag(elts.map(_.chiselCloneType))).asInstanceOf[this.type]
-
   // IndexedSeq has its own hashCode/equals that we must not use
   override def hashCode: Int = super[Record].hashCode
   override def equals(that: Any): Boolean = super[Record].equals(that)

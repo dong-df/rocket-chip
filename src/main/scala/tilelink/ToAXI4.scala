@@ -7,58 +7,70 @@ import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
 import freechips.rocketchip.amba.axi4._
-import scala.math.{min, max}
+import freechips.rocketchip.amba._
 
-class TLtoAXI4IdMap(tl: TLClientPortParameters, axi4: AXI4MasterPortParameters) {
-  private val axiDigits = String.valueOf(axi4.endId-1).length()
-  private val tlDigits = String.valueOf(tl.endSourceId-1).length()
-  private val fmt = s"\t[%${axiDigits}d, %${axiDigits}d) <= [%${tlDigits}d, %${tlDigits}d) %s%s%s"
-  private val sorted = tl.clients.sortWith(TLToAXI4.sortByType)
+class AXI4TLStateBundle(val sourceBits: Int) extends Bundle {
+  val size   = UInt(width = 4)
+  val source = UInt(width = sourceBits max 1)
+}
 
-  val mapping: Seq[TLToAXI4IdMapEntry] = (sorted zip axi4.masters) map { case (c, m) =>
-    TLToAXI4IdMapEntry(m.id, c.sourceId, c.name, c.supportsProbe, c.requestFifo)
+case object AXI4TLState extends ControlKey[AXI4TLStateBundle]("tl_state")
+case class AXI4TLStateField(sourceBits: Int) extends BundleField(AXI4TLState) {
+  def data = Output(new AXI4TLStateBundle(sourceBits))
+  def default(x: AXI4TLStateBundle) = {
+    x.size   := 0.U
+    x.source := 0.U
+  }
+}
+
+/** TLtoAXI4IdMap serves as a record for the translation performed between id spaces.
+  *
+  * Its member [axi4Masters] is used as the new AXI4MasterParameters in diplomacy.
+  * Its member [mapping] is used as the template for the circuit generated in TLToAXI4Node.module.
+  */
+class TLtoAXI4IdMap(tlPort: TLMasterPortParameters) extends IdMap[TLToAXI4IdMapEntry]
+{
+  val tlMasters = tlPort.masters.sortBy(_.sourceId).sortWith(TLToAXI4.sortByType)
+  private val axi4IdSize = tlMasters.map { tl => if (tl.requestFifo) 1 else tl.sourceId.size }
+  private val axi4IdStart = axi4IdSize.scanLeft(0)(_+_).init
+  val axi4Masters = axi4IdStart.zip(axi4IdSize).zip(tlMasters).map { case ((start, size), tl) =>
+    AXI4MasterParameters(
+      name      = tl.name,
+      id        = IdRange(start, start+size),
+      aligned   = true,
+      maxFlight = Some(if (tl.requestFifo) tl.sourceId.size else 1),
+      nodePath  = tl.nodePath)
   }
 
-  def pretty: String = mapping.map(_.pretty(fmt)).mkString(",\n")
+  private val axi4IdEnd = axi4Masters.map(_.id.end).max
+  private val axiDigits = String.valueOf(axi4IdEnd-1).length()
+  private val tlDigits = String.valueOf(tlPort.endSourceId-1).length()
+  protected val fmt = s"\t[%${axiDigits}d, %${axiDigits}d) <= [%${tlDigits}d, %${tlDigits}d) %s%s%s"
+
+  val mapping: Seq[TLToAXI4IdMapEntry] = tlMasters.zip(axi4Masters).map { case (tl, axi) =>
+    TLToAXI4IdMapEntry(axi.id, tl.sourceId, tl.name, tl.supports.probe, tl.requestFifo)
+  }
 }
 
-case class TLToAXI4IdMapEntry(axi4Id: IdRange, tlId: IdRange, name: String, isCache: Boolean, requestFifo: Boolean) {
-  def pretty(fmt: String) = fmt.format(
-    axi4Id.start,
-    axi4Id.end,
-    tlId.start,
-    tlId.end,
-    s""""$name"""",
-    if (isCache) " [CACHE]" else "",
-    if (requestFifo) " [FIFO]" else "")
+case class TLToAXI4IdMapEntry(axi4Id: IdRange, tlId: IdRange, name: String, isCache: Boolean, requestFifo: Boolean)
+  extends IdMapEntry
+{
+  val from = tlId
+  val to = axi4Id
+  val maxTransactionsInFlight = Some(tlId.size)
 }
 
-case class TLToAXI4Node(stripBits: Int = 0)(implicit valName: ValName) extends MixedAdapterNode(TLImp, AXI4Imp)(
+case class TLToAXI4Node(wcorrupt: Boolean = true)(implicit valName: ValName) extends MixedAdapterNode(TLImp, AXI4Imp)(
   dFn = { p =>
-    p.clients.foreach { c =>
-      require (c.sourceId.start % (1 << stripBits) == 0 &&
-               c.sourceId.end   % (1 << stripBits) == 0,
-               s"Cannot strip bits of aligned client ${c.name}: ${c.sourceId}")
-    }
-    val clients = p.clients.sortWith(TLToAXI4.sortByType _)
-    val idSize = clients.map { c => if (c.requestFifo) 1 else (c.sourceId.size >> stripBits) }
-    val idStart = idSize.scanLeft(0)(_+_).init
-    val masters = ((idStart zip idSize) zip clients) map { case ((start, size), c) =>
-      AXI4MasterParameters(
-        name      = c.name,
-        id        = IdRange(start, start+size),
-        aligned   = true,
-        maxFlight = Some(if (c.requestFifo) c.sourceId.size else (1 << stripBits)),
-        nodePath  = c.nodePath)
-    }
     AXI4MasterPortParameters(
-      masters  = masters,
-      opaqueBits = p.userBitWidth, // TL user bits that need to be propagated from TL clients to AXI managers
-      userBits = log2Ceil(p.endSourceId) + 4)
+      masters    = (new TLtoAXI4IdMap(p)).axi4Masters,
+      requestFields = (if (wcorrupt) Seq(AMBACorruptField()) else Seq()) ++ p.requestFields.filter(!_.isInstanceOf[AMBAProtField]),
+      echoFields    = AXI4TLStateField(log2Ceil(p.endSourceId)) +: p.echoFields,
+      responseKeys  = p.responseKeys)
   },
-  uFn = { p => TLManagerPortParameters(
+  uFn = { p => TLSlavePortParameters.v1(
     managers = p.slaves.map { case s =>
-      TLManagerParameters(
+      TLSlaveParameters.v1(
         address            = s.address,
         resources          = s.resources,
         regionType         = s.regionType,
@@ -71,12 +83,16 @@ case class TLToAXI4Node(stripBits: Int = 0)(implicit valName: ValName) extends M
         mayDenyPut         = true,
         mayDenyGet         = true)},
       beatBytes = p.beatBytes,
-      minLatency = p.minLatency)
+      minLatency = p.minLatency,
+      responseFields = p.responseFields,
+      requestKeys    = AMBAProt +: p.requestKeys)
   })
 
-class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String] = None, val stripBits: Int = 0)(implicit p: Parameters) extends LazyModule
+// wcorrupt alone is not enough; a slave must include AMBACorrupt in the slave port's requestKeys
+class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String] = None, val stripBits: Int = 0, val wcorrupt: Boolean = true)(implicit p: Parameters) extends LazyModule
 {
-  val node = TLToAXI4Node(stripBits)
+  require(stripBits == 0, "stripBits > 0 is no longer supported on TLToAXI4")
+  val node = TLToAXI4Node(wcorrupt)
 
   lazy val module = new LazyModuleImp(this) {
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
@@ -87,15 +103,15 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
       slaves.foreach { s => require (s.interleavedId == slaves(0).interleavedId) }
 
       // Construct the source=>ID mapping table
-      val map = new TLtoAXI4IdMap(edgeIn.client, edgeOut.master)
+      val map = new TLtoAXI4IdMap(edgeIn.client)
       val sourceStall = Wire(Vec(edgeIn.client.endSourceId, Bool()))
       val sourceTable = Wire(Vec(edgeIn.client.endSourceId, out.aw.bits.id))
       val idStall = Wire(init = Vec.fill(edgeOut.master.endId) { Bool(false) })
       var idCount = Array.fill(edgeOut.master.endId) { None:Option[Int] }
 
-      Annotated.idMapping(this, map.mapping).foreach { case TLToAXI4IdMapEntry(axi4Id, tlId, _, _, fifo) =>
+      map.mapping.foreach { case TLToAXI4IdMapEntry(axi4Id, tlId, _, _, fifo) =>
         for (i <- 0 until tlId.size) {
-          val id = axi4Id.start + (if (fifo) 0 else (i >> stripBits))
+          val id = axi4Id.start + (if (fifo) 0 else i)
           sourceStall(tlId.start + i) := idStall(id)
           sourceTable(tlId.start + i) := UInt(id)
         }
@@ -109,51 +125,28 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
 
       // We need to keep the following state from A => D: (size, source)
       // All of those fields could potentially require 0 bits (argh. Chisel.)
-      // We will pack all of that extra information into the user bits.
+      // We will pack all of that extra information into the echo bits.
 
-      val opaqueBits = edgeOut.master.opaqueBits
-      val userBits = edgeOut.master.userBits
-      val sourceBits = log2Ceil(edgeIn.client.endSourceId)
-      val sizeBits = log2Ceil(edgeIn.maxLgSize+1)
-      val stateBits = sizeBits + sourceBits // could be 0
-      require (stateBits <= out.aw.bits.params.userBits)
-
+      require (log2Ceil(edgeIn.maxLgSize+1) <= 4)
       val a_address = edgeIn.address(in.a.bits)
       val a_source  = in.a.bits.source
       val a_size    = edgeIn.size(in.a.bits)
       val a_isPut   = edgeIn.hasData(in.a.bits)
       val (a_first, a_last, _) = edgeIn.firstlast(in.a)
 
-      // Make sure the fields are within the bounds we assumed
-      assert (a_source  < UInt(BigInt(1) << sourceBits))
-      assert (a_size    < UInt(BigInt(1) << sizeBits))
+      val r_state = out.r.bits.echo(AXI4TLState)
+      val r_source  = r_state.source
+      val r_size    = r_state.size
 
-      // Carefully pack/unpack fields into the state we send
-      val baseEnd = 0
-      val (sourceEnd, sourceOff) = (sourceBits + baseEnd,   baseEnd)
-      val (sizeEnd,   sizeOff)   = (sizeBits   + sourceEnd, sourceEnd)
-      require (sizeEnd == stateBits)
-
-      // pack the TL opaque bits if present
-      val a_state = if (opaqueBits > 0) {
-        (a_source << sourceOff) | (a_size << sizeOff) | (in.a.bits.user.get << userBits.U)
-      } else {
-        (a_source << sourceOff) | (a_size << sizeOff)
-      }
-
-      val r_state = out.r.bits.user.getOrElse(UInt(0))
-      val r_source  = if (sourceBits > 0) r_state(sourceEnd-1, sourceOff) else UInt(0)
-      val r_size    = if (sizeBits   > 0) r_state(sizeEnd  -1, sizeOff)   else UInt(0)
-
-      val b_state = out.b.bits.user.getOrElse(UInt(0))
-      val b_source  = if (sourceBits > 0) b_state(sourceEnd-1, sourceOff) else UInt(0)
-      val b_size    = if (sizeBits   > 0) b_state(sizeEnd  -1, sizeOff)   else UInt(0)
+      val b_state = out.b.bits.echo(AXI4TLState)
+      val b_source  = b_state.source
+      val b_size    = b_state.size
 
       // We need these Queues because AXI4 queues are irrevocable
       val depth = if (combinational) 1 else 2
       val out_arw = Wire(Decoupled(new AXI4BundleARW(out.params)))
       val out_w = Wire(out.w)
-      out.w <> Queue.irrevocable(out_w, entries=depth, flow=combinational)
+      out.w :<> Queue.irrevocable(out_w, entries=depth, flow=combinational)
       val queue_arw = Queue.irrevocable(out_arw, entries=depth, flow=combinational)
 
       // Fan out the ARW channel to AR and AW
@@ -179,7 +172,25 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
       arw.cache := UInt(0) // do not allow AXI to modify our transactions
       arw.prot  := AXI4Parameters.PROT_PRIVILEDGED
       arw.qos   := UInt(0) // no QoS
-      arw.user.foreach { _ := a_state }
+      arw.user :<= in.a.bits.user
+      arw.echo :<= in.a.bits.echo
+      val a_extra = arw.echo(AXI4TLState)
+      a_extra.source := a_source
+      a_extra.size   := a_size
+
+      in.a.bits.user.lift(AMBAProt).foreach { x =>
+        val prot  = Wire(Vec(3, Bool()))
+        val cache = Wire(Vec(4, Bool()))
+        prot(0) :=  x.privileged
+        prot(1) := !x.secure
+        prot(2) :=  x.fetch
+        cache(0) := x.bufferable
+        cache(1) := x.modifiable
+        cache(2) := x.readalloc
+        cache(3) := x.writealloc
+        arw.prot  := Cat(prot.reverse)
+        arw.cache := Cat(cache.reverse)
+      }
 
       val stall = sourceStall(in.a.bits.source) && a_first
       in.a.ready := !stall && Mux(a_isPut, (doneAW || out_arw.ready) && out_w.ready, out_arw.ready)
@@ -189,15 +200,21 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
       out_w.bits.data := in.a.bits.data
       out_w.bits.strb := in.a.bits.mask
       out_w.bits.last := a_last
-      out_w.bits.corrupt.foreach { _ := in.a.bits.corrupt }
+      out_w.bits.user.lift(AMBACorrupt).foreach { _ := in.a.bits.corrupt }
 
       // R and B => D arbitration
       val r_holds_d = RegInit(Bool(false))
       when (out.r.fire()) { r_holds_d := !out.r.bits.last }
-      // Give R higher priority than B
-      val r_wins = out.r.valid || r_holds_d
+      // Give R higher priority than B, unless B has been delayed for 8 cycles
+      val b_delay = Reg(UInt(width=3))
+      when (out.b.valid && !out.b.ready) {
+        b_delay := b_delay + UInt(1)
+      } .otherwise {
+        b_delay := UInt(0)
+      }
+      val r_wins = (out.r.valid && b_delay =/= UInt(7)) || r_holds_d
 
-      out.r.ready := in.d.ready
+      out.r.ready := in.d.ready && r_wins
       out.b.ready := in.d.ready && !r_wins
       in.d.valid := Mux(r_wins, out.r.valid, out.b.valid)
 
@@ -212,6 +229,10 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
 
       val r_d = edgeIn.AccessAck(r_source, r_size, UInt(0), denied = r_denied, corrupt = r_corrupt || r_denied)
       val b_d = edgeIn.AccessAck(b_source, b_size, denied = b_denied)
+      r_d.user :<= out.r.bits.user
+      r_d.echo :<= out.r.bits.echo
+      b_d.user :<= out.b.bits.user
+      b_d.echo :<= out.b.bits.echo
 
       in.d.bits := Mux(r_wins, r_d, b_d)
       in.d.bits.data := out.r.bits.data // avoid a costly Mux
@@ -257,17 +278,17 @@ class TLToAXI4(val combinational: Boolean = true, val adapterName: Option[String
 
 object TLToAXI4
 {
-  def apply(combinational: Boolean = true, adapterName: Option[String] = None, stripBits: Int = 0)(implicit p: Parameters) =
+  def apply(combinational: Boolean = true, adapterName: Option[String] = None, stripBits: Int = 0, wcorrupt: Boolean = true)(implicit p: Parameters) =
   {
-    val tl2axi4 = LazyModule(new TLToAXI4(combinational, adapterName, stripBits))
+    val tl2axi4 = LazyModule(new TLToAXI4(combinational, adapterName, stripBits, wcorrupt))
     tl2axi4.node
   }
 
-  def sortByType(a: TLClientParameters, b: TLClientParameters): Boolean = {
-    if ( a.supportsProbe && !b.supportsProbe) return false
-    if (!a.supportsProbe &&  b.supportsProbe) return true
-    if ( a.requestFifo   && !b.requestFifo  ) return false
-    if (!a.requestFifo   &&  b.requestFifo  ) return true
+  def sortByType(a: TLMasterParameters, b: TLMasterParameters): Boolean = {
+    if ( a.supports.probe && !b.supports.probe) return false
+    if (!a.supports.probe &&  b.supports.probe) return true
+    if ( a.requestFifo    && !b.requestFifo   ) return false
+    if (!a.requestFifo    &&  b.requestFifo   ) return true
     return false
   }
 }

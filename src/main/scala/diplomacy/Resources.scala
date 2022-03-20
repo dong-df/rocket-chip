@@ -3,8 +3,6 @@
 package freechips.rocketchip.diplomacy
 
 import Chisel.log2Ceil
-import freechips.rocketchip.diplomaticobjectmodel.DiplomaticObjectModelAddressing
-import freechips.rocketchip.diplomaticobjectmodel.model._
 
 import scala.collection.immutable.{ListMap, SortedMap}
 import scala.collection.mutable.HashMap
@@ -92,7 +90,7 @@ abstract class DeviceSnippet extends Device
 object Device
 {
   private var index: Int = 0
-  def skipIndexes(x: Int) { index += x }
+  def skipIndexes(x: Int): Unit = { index += x }
 }
 
 /** A trait for devices that generate interrupts. */
@@ -150,7 +148,7 @@ trait DeviceRegName
       devname
     } else {
       val (named, bulk) = reg.partition { case (k, v) => DiplomacyUtils.regName(k).isDefined }
-      val mainreg = reg.find(x => DiplomacyUtils.regName(x._1) == "control").getOrElse(reg.head)._2
+      val mainreg = reg.head._2
       require (!mainreg.isEmpty, s"reg binding for $devname is empty!")
       mainreg.head.value match {
         case x: ResourceAddress => s"${devname}@${x.address.head.base.toString(16)}"
@@ -259,11 +257,11 @@ class MemoryDevice extends Device with DeviceRegName
 
 case class Resource(owner: Device, key: String)
 {
-  def bind(user: Device, value: ResourceValue) {
+  def bind(user: Device, value: ResourceValue): Unit = {
     val scope = BindingScope.active.get
     scope.resourceBindings = (this, Some(user), value) +: scope.resourceBindings
   }
-  def bind(value: ResourceValue) {
+  def bind(value: ResourceValue): Unit = {
     val scope = BindingScope.active.get
     scope.resourceBindings = (this, None, value) +: scope.resourceBindings
   }
@@ -405,7 +403,7 @@ object ResourceBinding
   /** Add a resource callback function to the callback list BindingScope.resourceBindingFns.
     * @param block      the callback function to be added.
     */
-  def apply(block: => Unit) {
+  def apply(block: => Unit): Unit = {
     val scope = BindingScope.find()
     require (scope.isDefined, "ResourceBinding must be called from within a BindingScope")
     scope.get.resourceBindingFns = { () => block } +: scope.get.resourceBindingFns
@@ -442,9 +440,11 @@ object ResourceAnchors
   val cpus = new Device {
     def describe(resources: ResourceBindings): Description = {
       val width = resources("width").map(_.value)
+      val hertz = resources("hertz").map(_.value)
       Description("cpus", Map(
-        "#address-cells" -> width,
-        "#size-cells"    -> Seq(ResourceInt(0))))
+        "#address-cells"     -> width,
+        "#size-cells"        -> Seq(ResourceInt(0)),
+        "timebase-frequency" -> hertz))
     }
   }
 

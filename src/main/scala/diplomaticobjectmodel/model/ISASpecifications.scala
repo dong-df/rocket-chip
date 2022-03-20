@@ -2,16 +2,16 @@
 
 package freechips.rocketchip.diplomaticobjectmodel.model
 
-import freechips.rocketchip.util.BooleanToAugmentedBoolean
-import freechips.rocketchip.tile.CoreParams
 
 sealed trait PrivilegedArchitectureExtension extends OMEnum
 case object MachineLevelISA extends PrivilegedArchitectureExtension
+case object HypervisorLevelISA extends PrivilegedArchitectureExtension
 case object SupervisorLevelISA extends PrivilegedArchitectureExtension
 
 object PrivilegedArchitectureExtensions {
   val specifications = Map[PrivilegedArchitectureExtension, String](
     MachineLevelISA -> "Machine-Level ISA",
+    HypervisorLevelISA -> "Hypervisor-Level ISA",
     SupervisorLevelISA -> "Supervisor-Level ISA"
   )
 
@@ -36,8 +36,10 @@ object ISAExtensions {
     F -> "F Standard Extension for Single-Precision Floating-Point",
     D -> "D Standard Extension for Double-Precision Floating-Point",
     C -> "C Standard Extension for Compressed Instruction",
+    B -> "B Standard Extension for Bit Manipulation",
     U -> "The RISC‑V Instruction Set Manual, Volume II: Privileged Architecture",
-    S -> "Supervisor-Level ISA"
+    S -> "Supervisor-Level ISA",
+    H -> "H Standard Extension for Hypervisor",
   )
 
   def specVersion(extension: OMExtensionType, version: String): OMSpecification = OMSpecification(specifications(extension), version)

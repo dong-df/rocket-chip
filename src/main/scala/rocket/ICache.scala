@@ -5,22 +5,25 @@ package freechips.rocketchip.rocket
 
 import Chisel._
 import Chisel.ImplicitConversions._
+import freechips.rocketchip.amba._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.util.{DescribedSRAM, _}
-import freechips.rocketchip.util.property._
+import freechips.rocketchip.util.property
 import chisel3.internal.sourceinfo.SourceInfo
 import chisel3.dontTouch
-import freechips.rocketchip.diplomaticobjectmodel.DiplomaticObjectModelAddressing
-import freechips.rocketchip.diplomaticobjectmodel.model._
+import chisel3.util.random.LFSR
 
 case class ICacheParams(
     nSets: Int = 64,
     nWays: Int = 4,
     rowBits: Int = 128,
-    nTLBEntries: Int = 32,
+    nTLBSets: Int = 1,
+    nTLBWays: Int = 32,
+    nTLBBasePageSectors: Int = 4,
+    nTLBSuperpages: Int = 4,
     cacheIdBits: Int = 0,
     tagECC: Option[String] = None,
     dataECC: Option[String] = None,
@@ -47,13 +50,19 @@ class ICacheErrors(implicit p: Parameters) extends CoreBundle()(p)
     with CanHaveErrors {
   val correctable = (cacheParams.tagCode.canDetect || cacheParams.dataCode.canDetect).option(Valid(UInt(width = paddrBits)))
   val uncorrectable = (cacheParams.itimAddr.nonEmpty && cacheParams.dataCode.canDetect).option(Valid(UInt(width = paddrBits)))
+  val bus = Valid(UInt(width = paddrBits))
 }
 
-class ICache(val icacheParams: ICacheParams, val hartId: Int)(implicit p: Parameters) extends LazyModule {
+class ICache(val icacheParams: ICacheParams, val staticIdForMetadataUseOnly: Int)(implicit p: Parameters) extends LazyModule {
   lazy val module = new ICacheModule(this)
-  val masterNode = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters(
-    sourceId = IdRange(0, 1 + icacheParams.prefetch.toInt), // 0=refill, 1=hint
-    name = s"Core ${hartId} ICache")))))
+  val hartIdSinkNodeOpt = icacheParams.itimAddr.map(_ => BundleBridgeSink[UInt]())
+  val mmioAddressPrefixSinkNodeOpt = icacheParams.itimAddr.map(_ => BundleBridgeSink[UInt]())
+  val useVM = p(TileKey).core.useVM
+  val masterNode = TLClientNode(Seq(TLMasterPortParameters.v1(
+    clients = Seq(TLMasterParameters.v1(
+      sourceId = IdRange(0, 1 + icacheParams.prefetch.toInt), // 0=refill, 1=hint
+      name = s"Core ${staticIdForMetadataUseOnly} ICache")),
+    requestFields = useVM.option(Seq()).getOrElse(Seq(AMBAProtField())))))
 
   val size = icacheParams.nSets * icacheParams.nWays * icacheParams.blockBytes
   val itim_control_offset = size - icacheParams.nSets * icacheParams.blockBytes
@@ -76,8 +85,8 @@ class ICache(val icacheParams: ICacheParams, val hartId: Int)(implicit p: Parame
 
   private val wordBytes = icacheParams.fetchBytes
   val slaveNode =
-    TLManagerNode(icacheParams.itimAddr.toSeq.map { itimAddr => TLManagerPortParameters(
-      Seq(TLManagerParameters(
+    TLManagerNode(icacheParams.itimAddr.toSeq.map { itimAddr => TLSlavePortParameters.v1(
+      Seq(TLSlaveParameters.v1(
         address         = Seq(AddressSet(itimAddr, size-1)),
         resources       = device.reg("mem"),
         regionType      = RegionType.IDEMPOTENT,
@@ -95,7 +104,6 @@ class ICacheResp(outer: ICache) extends Bundle {
   val replay = Bool()
   val ae = Bool()
 
-  override def cloneType = new ICacheResp(outer).asInstanceOf[this.type]
 }
 
 class ICachePerfEvents extends Bundle {
@@ -103,12 +111,12 @@ class ICachePerfEvents extends Bundle {
 }
 
 class ICacheBundle(val outer: ICache) extends CoreBundle()(outer.p) {
-  val hartid = UInt(INPUT, hartIdLen)
   val req = Decoupled(new ICacheReq).flip
   val s1_paddr = UInt(INPUT, paddrBits) // delayed one cycle w.r.t. req
   val s2_vaddr = UInt(INPUT, vaddrBits) // delayed two cycles w.r.t. req
   val s1_kill = Bool(INPUT) // delayed one cycle w.r.t. req
   val s2_kill = Bool(INPUT) // delayed two cycles; prevents I$ miss emission
+  val s2_cacheable = Bool(INPUT) // should L2 cache line on a miss?
   val s2_prefetch = Bool(INPUT) // should I$ prefetch next line on a miss?
 
   val resp = Valid(new ICacheResp(outer))
@@ -137,11 +145,13 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   require(!usingVM || outer.icacheParams.itimAddr.isEmpty || pgIdxBits >= untagBits,
     s"When VM and ITIM are enabled, I$$ set size must not exceed ${1<<(pgIdxBits-10)} KiB; got ${(outer.size/nWays)>>10} KiB")
 
+  val io_hartid = outer.hartIdSinkNodeOpt.map(_.bundle)
+  val io_mmio_address_prefix = outer.mmioAddressPrefixSinkNodeOpt.map(_.bundle)
   val scratchpadOn = RegInit(false.B)
   val scratchpadMax = tl_in.map(tl => Reg(UInt(width = log2Ceil(nSets * (nWays - 1)))))
   def lineInScratchpad(line: UInt) = scratchpadMax.map(scratchpadOn && line <= _).getOrElse(false.B)
   val scratchpadBase = outer.icacheParams.itimAddr.map { dummy =>
-    p(LookupByHartId)(_.icache.flatMap(_.itimAddr.map(_.U)), io.hartid)
+    p(LookupByHartId)(_.icache.flatMap(_.itimAddr.map(_.U)), io_hartid.get) | io_mmio_address_prefix.get
   }
   def addrMaybeInScratchpad(addr: UInt) = scratchpadBase.map(base => addr >= base && addr < base + outer.size).getOrElse(false.B)
   def addrInScratchpad(addr: UInt) = addrMaybeInScratchpad(addr) && lineInScratchpad(addr(untagBits+log2Ceil(nWays)-1, blockOffBits))
@@ -188,7 +198,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
 
   val repl_way = if (isDM) UInt(0) else {
     // pick a way that is not used by the scratchpad
-    val v0 = LFSR16(refill_fire)(log2Up(nWays)-1,0)
+    val v0 = LFSR(16, refill_fire)(log2Up(nWays)-1,0)
     var v = v0
     for (i <- log2Ceil(nWays) - 1 to 0 by -1) {
       val mask = nWays - (BigInt(1) << (i + 1))
@@ -213,8 +223,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     val enc_tag = tECC.encode(Cat(refillError, refill_tag))
     tag_array.write(refill_idx, Vec.fill(nWays)(enc_tag), Seq.tabulate(nWays)(repl_way === _))
 
-    ccover(tl_out.d.bits.corrupt, "D_CORRUPT", "I$ D-channel corrupt")
+    ccover(refillError, "D_CORRUPT", "I$ D-channel corrupt")
   }
+  io.errors.bus.valid := tl_out.d.fire() && (tl_out.d.bits.denied || tl_out.d.bits.corrupt)
+  io.errors.bus.bits  := (refill_paddr >> blockOffBits) << blockOffBits
 
   val vb_array = Reg(init=Bits(0, nSets*nWays))
   when (refill_one_beat) {
@@ -286,8 +298,12 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     }
   }
 
+  // When writing a full scratchpad word, suppress the read so Xs don't leak out
+  val s1s2_full_word_write = Wire(init = false.B)
+  val s1_dont_read = s1_slaveValid && s1s2_full_word_write
+
   val s1_clk_en = s1_valid || s1_slaveValid
-  val s2_tag_hit = RegEnable(s1_tag_hit, s1_clk_en)
+  val s2_tag_hit = RegEnable(Mux(s1_dont_read, 0.U.asTypeOf(s1_tag_hit), s1_tag_hit), s1_clk_en)
   val s2_hit_way = OHToUInt(s2_tag_hit)
   val s2_scratchpad_word_addr = Cat(s2_hit_way, Mux(s2_slaveValid, s1s3_slaveAddr, io.s2_vaddr)(untagBits-1, log2Ceil(wordBits/8)), UInt(0, log2Ceil(wordBits/8)))
   val s2_dout = RegEnable(s1_dout, s1_clk_en)
@@ -297,11 +313,10 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   val s2_tl_error = RegEnable(s1_tl_error.asUInt.orR, s1_clk_en)
   val s2_data_decoded = dECC.decode(s2_way_mux)
   val s2_disparity = s2_tag_disparity || s2_data_decoded.error
-  val s2_full_word_write = Wire(init = false.B)
 
   val s1_scratchpad_hit = Mux(s1_slaveValid, lineInScratchpad(scratchpadLine(s1s3_slaveAddr)), addrInScratchpad(io.s1_paddr))
   val s2_scratchpad_hit = RegEnable(s1_scratchpad_hit, s1_clk_en)
-  val s2_report_uncorrectable_error = s2_scratchpad_hit && s2_data_decoded.uncorrectable && (s2_valid || (s2_slaveValid && !s2_full_word_write))
+  val s2_report_uncorrectable_error = s2_scratchpad_hit && s2_data_decoded.uncorrectable && (s2_valid || (s2_slaveValid && !s1s2_full_word_write))
   val s2_error_addr = scratchpadBase.map(base => Mux(s2_scratchpad_hit, base + s2_scratchpad_word_addr, 0.U)).getOrElse(0.U)
 
   // output signals
@@ -336,7 +351,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
         val respValid = RegInit(false.B)
         tl.a.ready := !(tl_out.d.valid || s1_slaveValid || s2_slaveValid || s3_slaveValid || respValid || !io.clock_enabled)
         val s1_a = RegEnable(tl.a.bits, s0_slaveValid)
-        s2_full_word_write := edge_in.get.hasData(s1_a) && s1_a.mask.andR
+        s1s2_full_word_write := edge_in.get.hasData(s1_a) && s1_a.mask.andR
         when (s0_slaveValid) {
           val a = tl.a.bits
           s1s3_slaveAddr := tl.a.bits.address
@@ -375,7 +390,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
         }
 
         respValid := s2_slaveValid || (respValid && !tl.d.ready)
-        val respError = RegEnable(s2_scratchpad_hit && s2_data_decoded.uncorrectable && !s2_full_word_write, s2_slaveValid)
+        val respError = RegEnable(s2_scratchpad_hit && s2_data_decoded.uncorrectable && !s1s2_full_word_write, s2_slaveValid)
         when (s2_slaveValid) {
           when (edge_in.get.hasData(s1_a) || s2_data_decoded.error) { s3_slaveValid := true }
           def byteEn(i: Int) = !(edge_in.get.hasData(s1_a) && s1_a.mask(i))
@@ -405,6 +420,7 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
                     fromSource = UInt(0),
                     toAddress = (refill_paddr >> blockOffBits) << blockOffBits,
                     lgSize = lgCacheBlockBytes)._2
+
   if (cacheParams.prefetch) {
     val (crosses_page, next_block) = Split(refill_paddr(pgIdxBits-1, blockOffBits) +& 1, pgIdxBits-blockOffBits)
     when (tl_out.a.fire()) {
@@ -435,6 +451,18 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     ccover(!refill_valid && (tl_out.d.fire() && !refill_one_beat), "PREFETCH_D_AFTER_MISS_D", "I$ prefetch resolves after miss")
     ccover(tl_out.a.fire() && hint_outstanding, "PREFETCH_D_AFTER_MISS_A", "I$ prefetch resolves after second miss")
   }
+  // Drive APROT information
+  tl_out.a.bits.user.lift(AMBAProt).foreach { x =>
+    // Rocket caches all fetch requests, and it's difficult to differentiate privileged/unprivileged on
+    // cached data, so mark as privileged
+    x.fetch       := true.B
+    x.secure      := true.B
+    x.privileged  := true.B
+    x.bufferable  := true.B
+    x.modifiable  := true.B
+    x.readalloc   := io.s2_cacheable
+    x.writealloc  := io.s2_cacheable
+  }
   tl_out.b.ready := Bool(true)
   tl_out.c.valid := Bool(false)
   tl_out.e.valid := Bool(false)
@@ -459,27 +487,27 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
   ccover(invalidate && refill_valid, "FLUSH_DURING_MISS", "I$ flushed during miss")
 
   def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
-    cover(cond, s"ICACHE_$label", "MemorySystem;;" + desc)
+    property.cover(cond, s"ICACHE_$label", "MemorySystem;;" + desc)
 
-  val mem_active_valid = Seq(CoverBoolean(s2_valid, Seq("mem_active")))
+  val mem_active_valid = Seq(property.CoverBoolean(s2_valid, Seq("mem_active")))
   val data_error = Seq(
-    CoverBoolean(!s2_data_decoded.correctable && !s2_data_decoded.uncorrectable, Seq("no_data_error")),
-    CoverBoolean(s2_data_decoded.correctable, Seq("data_correctable_error")),
-    CoverBoolean(s2_data_decoded.uncorrectable, Seq("data_uncorrectable_error")))
+    property.CoverBoolean(!s2_data_decoded.correctable && !s2_data_decoded.uncorrectable, Seq("no_data_error")),
+    property.CoverBoolean(s2_data_decoded.correctable, Seq("data_correctable_error")),
+    property.CoverBoolean(s2_data_decoded.uncorrectable, Seq("data_uncorrectable_error")))
   val request_source = Seq(
-    CoverBoolean(!s2_slaveValid, Seq("from_CPU")),
-    CoverBoolean(s2_slaveValid, Seq("from_TL"))
+    property.CoverBoolean(!s2_slaveValid, Seq("from_CPU")),
+    property.CoverBoolean(s2_slaveValid, Seq("from_TL"))
   )
   val tag_error = Seq(
-    CoverBoolean(!s2_tag_disparity, Seq("no_tag_error")),
-    CoverBoolean(s2_tag_disparity, Seq("tag_error"))
+    property.CoverBoolean(!s2_tag_disparity, Seq("no_tag_error")),
+    property.CoverBoolean(s2_tag_disparity, Seq("tag_error"))
   )
   val mem_mode = Seq(
-    CoverBoolean(s2_scratchpad_hit, Seq("ITIM_mode")),
-    CoverBoolean(!s2_scratchpad_hit, Seq("cache_mode"))
+    property.CoverBoolean(s2_scratchpad_hit, Seq("ITIM_mode")),
+    property.CoverBoolean(!s2_scratchpad_hit, Seq("cache_mode"))
   )
 
-  val error_cross_covers = new CrossProperty(
+  val error_cross_covers = new property.CrossProperty(
     Seq(mem_active_valid, data_error, tag_error, request_source, mem_mode),
     Seq(
       // tag error cannot occur in ITIM mode
@@ -489,5 +517,5 @@ class ICacheModule(outer: ICache) extends LazyModuleImp(outer)
     ),
     "MemorySystem;;Memory Bit Flip Cross Covers")
 
-  cover(error_cross_covers)
+  property.cover(error_cross_covers)
 }

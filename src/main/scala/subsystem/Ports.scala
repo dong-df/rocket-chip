@@ -2,8 +2,7 @@
 
 package freechips.rocketchip.subsystem
 
-import Chisel._
-import freechips.rocketchip.config.{Field, Parameters}
+import freechips.rocketchip.config.Field
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.amba.axi4._
@@ -135,8 +134,8 @@ trait CanHaveMasterTLMMIOPort { this: BaseSubsystem =>
 
   val mmioTLNode = TLManagerNode(
     mmioPortParamsOpt.map(params =>
-      TLManagerPortParameters(
-        managers = Seq(TLManagerParameters(
+      TLSlavePortParameters.v1(
+        managers = Seq(TLSlaveParameters.v1(
           address            = AddressSet.misaligned(params.base, params.size),
           resources          = device.ranges,
           executable         = params.executable,
@@ -170,8 +169,8 @@ trait CanHaveSlaveTLPort { this: BaseSubsystem =>
 
   val l2FrontendTLNode = TLClientNode(
     slavePortParamsOpt.map(params =>
-      TLClientPortParameters(
-        clients = Seq(TLClientParameters(
+      TLMasterPortParameters.v1(
+        clients = Seq(TLMasterParameters.v1(
           name     = portName.kebab,
           sourceId = IdRange(0, 1 << params.idBits))))).toSeq)
 

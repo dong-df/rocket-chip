@@ -2,9 +2,8 @@
 
 package freechips.rocketchip.diplomaticobjectmodel.model
 
-import freechips.rocketchip.diplomacy.{ResourceBindings, ResourceBindingsMap}
+import freechips.rocketchip.diplomacy.{ResourceBindings, IdRange, IdMapEntry}
 import freechips.rocketchip.diplomaticobjectmodel.DiplomaticObjectModelAddressing
-import freechips.rocketchip.diplomaticobjectmodel.model._
 
 sealed trait PortType extends OMEnum
 case object SystemPortType extends PortType
@@ -79,12 +78,36 @@ case class TL_C(
   val _types: Seq[String] = Seq("TL_C", "TL",  "OMProtocol")
 ) extends TL
 
+
+class OMIDRange (val start: Int,
+                 val end: Int,
+                 val _types: Seq[String] = Seq("OMIDRange", "OMCompundType"))
+object OMIDRange {
+  def apply(i: IdRange): OMIDRange = {
+    new OMIDRange(i.start, i.end)
+  }
+}
+
+class OMIDMapEntry(val name: String,
+                   val from: OMIDRange,
+                   val to: OMIDRange,
+                   val isCache: Boolean,
+                   val requestFifo: Boolean,
+                   val maxTransactionsInFlight: Option[Int],
+                   val _types: Seq[String] = Seq("OMIDMapEntry", "OMCompoundType"))
+object OMIDMapEntry {
+  def apply[T <: IdMapEntry](i: T): OMIDMapEntry = {
+    new OMIDMapEntry(i.name, OMIDRange(i.from), OMIDRange(i.to), i.isCache, i.requestFifo, i.maxTransactionsInFlight)
+  }
+}
+
 trait OMPort extends OMDevice {
   memoryRegions: Seq[OMMemoryRegion]
   interrupts: Seq[OMInterrupt]
   def signalNamePrefix: String
   def width: Int
   def protocol: OMProtocol
+  def idMap: Seq[OMIDMapEntry]
 }
 
 trait InboundPort extends OMPort
@@ -96,6 +119,7 @@ case class FrontPort(
   signalNamePrefix: String,
   width: Int,
   protocol: OMProtocol,
+  idMap: Seq[OMIDMapEntry],
   _types: Seq[String] = Seq("FrontPort", "InboundPort", "OMPort", "OMDevice", "OMComponent", "OMCompoundType")
 ) extends InboundPort
 
@@ -105,6 +129,7 @@ case class MemoryPort(
   signalNamePrefix: String,
   width: Int,
   protocol: OMProtocol,
+  idMap: Seq[OMIDMapEntry],
   _types: Seq[String] = Seq("MemoryPort", "OutboundPort", "OMPort", "OMDevice", "OMComponent", "OMCompoundType")) extends OutboundPort
 
 case class PeripheralPort(
@@ -113,6 +138,7 @@ case class PeripheralPort(
   signalNamePrefix: String,
   width: Int,
   protocol: OMProtocol,
+  idMap: Seq[OMIDMapEntry],
   _types: Seq[String] = Seq("PeripheralPort", "OutboundPort", "OMPort", "OMDevice", "OMComponent", "OMCompoundType")) extends OutboundPort
 
 case class SystemPort(
@@ -121,24 +147,29 @@ case class SystemPort(
   signalNamePrefix: String,
   width: Int,
   protocol: OMProtocol,
+  idMap: Seq[OMIDMapEntry],
   _types: Seq[String] = Seq("SystemPort", "OutboundPort", "OMPort", "OMDevice", "OMComponent", "OMCompoundType")) extends OutboundPort
 
 object OMPortMaker {
-  val protocolSpecifications = Map[ProtocolType, String](
-    AHBProtocol -> "AMBA 3 AHB-Lite Protocol",
-    AXI4Protocol -> "AMBA 3 AXI4-Lite Protocol",
-    APBProtocol -> "AMBA 3 APB Protocol",
-    TLProtocol -> "Tile Link specification"
-  )
+  val protocolSpecifications = Map[(ProtocolType, SubProtocolType), String](
+   (AHBProtocol, AHBLiteSubProtocol)   -> "AHB Lite Protocol",
+   (AHBProtocol, AHBFullSubProtocol)   -> "AHB Full Protocol",
+   (AXI4Protocol, AXI4SubProtocol)     -> "AXI Protocol",
+   (AXI4Protocol, AXI4LiteSubProtocol) -> "AXI Lite Protocol",
+   (APBProtocol, APBSubProtocol)       -> "APB Protocol",
+   (TLProtocol, TL_UHSubProtocol)      -> "TileLink Protocol",
+   (TLProtocol, TL_ULSubProtocol)      -> "TileLink Protocol",
+   (TLProtocol, TL_CSubProtocol)       -> "TileLink Protocol"
+ )
 
   val protocolSpecificationVersions = Map[ProtocolType, String](
-    AHBProtocol -> "1.0",
-    AXI4Protocol -> "1.0",
+    AHBProtocol -> "3",
+    AXI4Protocol -> "4",
     APBProtocol -> "1.0",
     TLProtocol -> "1.8"
   )
 
-  def specVersion(protocol: ProtocolType, version: String): Option[OMSpecification] = Some(OMSpecification(protocolSpecifications(protocol), version))
+  def specVersion(protocol: ProtocolType, subProtocol: SubProtocolType, version: String): Option[OMSpecification] = Some(OMSpecification(protocolSpecifications(protocol, subProtocol), version))
 
   val portNames = Map[PortType, String](
     SystemPortType -> "System Port",
@@ -154,18 +185,19 @@ object OMPortMaker {
     protocol: ProtocolType,
     subProtocol: SubProtocolType,
     version: String,
-    beatBytes: Int): OMPort = {
+    beatBytes: Int,
+    idMap: Seq[OMIDMapEntry]): OMPort = {
     val documentationName = portNames(portType)
 
     val omProtocol = (protocol, subProtocol) match {
-      case (AXI4Protocol, AXI4SubProtocol) => AXI4(specification = specVersion(protocol, version))
-      case (AXI4Protocol, AXI4LiteSubProtocol) => AXI4_Lite(specification = specVersion(protocol, version))
-      case (AHBProtocol, AHBLiteSubProtocol) => AHB_Lite(specification = specVersion(protocol, version))
-      case (AHBProtocol, AHBFullSubProtocol) => AHB(specification = specVersion(protocol, version))
-      case (APBProtocol, APBSubProtocol) => APB(specification = specVersion(protocol, version))
-      case (TLProtocol, TL_UHSubProtocol) => TL_UH(specification = specVersion(protocol, version))
-      case (TLProtocol, TL_ULSubProtocol) => TL_UL(specification = specVersion(protocol, version))
-      case (TLProtocol, TL_CSubProtocol) => TL_C(specification = specVersion(protocol, version))
+      case (AXI4Protocol, AXI4SubProtocol) => AXI4(specification = specVersion(protocol, subProtocol, version))
+      case (AXI4Protocol, AXI4LiteSubProtocol) => AXI4_Lite(specification = specVersion(protocol, subProtocol, version))
+      case (AHBProtocol, AHBLiteSubProtocol) => AHB_Lite(specification = specVersion(protocol, subProtocol, version))
+      case (AHBProtocol, AHBFullSubProtocol) => AHB(specification = specVersion(protocol, subProtocol, version))
+      case (APBProtocol, APBSubProtocol) => APB(specification = specVersion(protocol, subProtocol, version))
+      case (TLProtocol, TL_UHSubProtocol) => TL_UH(specification = specVersion(protocol, subProtocol, version))
+      case (TLProtocol, TL_ULSubProtocol) => TL_UL(specification = specVersion(protocol, subProtocol, version))
+      case (TLProtocol, TL_CSubProtocol) => TL_C(specification = specVersion(protocol, subProtocol, version))
       case _ => throw new IllegalArgumentException(s"protocol $protocol, subProtocol $subProtocol")
     }
 
@@ -174,18 +206,18 @@ object OMPortMaker {
         val memRegions = DiplomaticObjectModelAddressing.getOMPortMemoryRegions(name = documentationName, rb)
         portType match {
           case SystemPortType => SystemPort(memoryRegions = memRegions, interrupts = Nil, signalNamePrefix = signalNamePrefix,
-            width = beatBytes * 8, protocol = omProtocol)
+            width = beatBytes * 8, protocol = omProtocol, idMap = idMap)
           case PeripheralPortType => PeripheralPort(memoryRegions = memRegions, interrupts = Nil, signalNamePrefix = signalNamePrefix,
-            width = beatBytes * 8, protocol = omProtocol)
+            width = beatBytes * 8, protocol = omProtocol, idMap = idMap)
           case MemoryPortType => MemoryPort(memoryRegions = memRegions, interrupts = Nil, signalNamePrefix = signalNamePrefix,
-            width = beatBytes * 8, protocol = omProtocol)
+            width = beatBytes * 8, protocol = omProtocol, idMap = idMap)
           case FrontPortType => throw new IllegalArgumentException
           case _ => throw new IllegalArgumentException
         }
       case None => {
         portType match {
           case FrontPortType => FrontPort(memoryRegions = Nil, interrupts = Nil,
-            signalNamePrefix = signalNamePrefix, width = beatBytes * 8, protocol = omProtocol)
+            signalNamePrefix = signalNamePrefix, width = beatBytes * 8, protocol = omProtocol, idMap = idMap)
           case _ => throw new IllegalArgumentException
         }
       }

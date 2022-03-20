@@ -8,7 +8,6 @@ package chisel3.shim
 import Chisel._
 import chisel3.experimental.BaseModule
 import chisel3.{RawModule, MultiIOModule}
-import chisel3.core.UserModule
 import chisel3.internal.Builder
 import chisel3.internal.firrtl.{Command, DefInstance}
 import scala.collection.immutable.ListMap
@@ -23,7 +22,6 @@ class ClonePorts protected[shim](elts: Data*) extends Record
 
 class CloneModule private (model: RawModule) extends BlackBox
 {
-  import CloneModule._
   override def desiredName = model.name
   val io = IO(new ClonePorts(model.getPorts.map(_.id): _*))
 }
@@ -35,7 +33,7 @@ object CloneModule
     val mod = Module(new CloneModule(model.asInstanceOf[RawModule]))
     // Rewrite the instance definition to be the original module
     // (this is needed because the original module gets clobbered by DCE + constant prop)
-    val method = classOf[UserModule].getDeclaredMethod("_commands")
+    val method = classOf[RawModule].getDeclaredMethod("_commands")
     method.setAccessible(true)
     val commands = method.invoke(Builder.forcedUserModule).asInstanceOf[ArrayBuffer[Command]]
     val victimIdx = commands.lastIndexWhere {

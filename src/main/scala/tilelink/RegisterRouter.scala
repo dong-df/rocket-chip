@@ -4,16 +4,33 @@ package freechips.rocketchip.tilelink
 
 import Chisel._
 import chisel3.RawModule
-import firrtl.annotations.ModuleName
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.diplomaticobjectmodel.model.{OMMemoryRegion, OMRegister, OMRegisterMap}
+import freechips.rocketchip.diplomaticobjectmodel.model.{OMRegister, OMRegisterMap}
 import freechips.rocketchip.regmapper._
-import freechips.rocketchip.interrupts._
-import freechips.rocketchip.util.{ElaborationArtefacts, GenRegDescsAnno, HeterogeneousBag}
+import freechips.rocketchip.util._
 
-import scala.math.{max, min}
+import scala.math.min
 
+class TLRegisterRouterExtraBundle(val sourceBits: Int, val sizeBits: Int) extends Bundle {
+  val source = UInt(width = sourceBits max 1)
+  val size   = UInt(width = sizeBits max 1)
+}
+
+case object TLRegisterRouterExtra extends ControlKey[TLRegisterRouterExtraBundle]("tlrr_extra")
+case class TLRegisterRouterExtraField(sourceBits: Int, sizeBits: Int) extends BundleField(TLRegisterRouterExtra) {
+  def data = Output(new TLRegisterRouterExtraBundle(sourceBits, sizeBits))
+  def default(x: TLRegisterRouterExtraBundle) = {
+    x.size   := 0.U
+    x.source := 0.U
+  }
+}
+
+/** TLRegisterNode is a specialized TL SinkNode that encapsulates MMIO registers.
+  * It provides functionality for describing and outputting metdata about the registers in several formats.
+  * It also provides a concrete implementation of a regmap function that will be used
+  * to wire a map of internal registers associated with this node to the node's interconnect port.
+  */
 case class TLRegisterNode(
     address:     Seq[AddressSet],
     device:      Device,
@@ -23,8 +40,8 @@ case class TLRegisterNode(
     undefZero:   Boolean = true,
     executable:  Boolean = false)(
     implicit valName: ValName)
-  extends SinkNode(TLImp)(Seq(TLManagerPortParameters(
-    Seq(TLManagerParameters(
+  extends SinkNode(TLImp)(Seq(TLSlavePortParameters.v1(
+    Seq(TLSlaveParameters.v1(
       address            = address,
       resources          = Seq(Resource(device, deviceKey)),
       executable         = executable,
@@ -49,18 +66,18 @@ case class TLRegisterNode(
     val a = bundleIn.a
     val d = bundleIn.d
 
-    // Please forgive me ...
-    val baseEnd = 0
-    val (sizeEnd,   sizeOff)   = (edge.bundle.sizeBits   + baseEnd, baseEnd)
-    val (sourceEnd, sourceOff) = (edge.bundle.sourceBits + sizeEnd, sizeEnd)
-
-    val params = RegMapperParams(log2Up(size/beatBytes), beatBytes, sourceEnd)
+    val fields = TLRegisterRouterExtraField(edge.bundle.sourceBits, edge.bundle.sizeBits) +: a.bits.params.echoFields
+    val params = RegMapperParams(log2Up(size/beatBytes), beatBytes, fields)
     val in = Wire(Decoupled(new RegMapperInput(params)))
     in.bits.read  := a.bits.opcode === TLMessages.Get
     in.bits.index := edge.addr_hi(a.bits)
     in.bits.data  := a.bits.data
     in.bits.mask  := a.bits.mask
-    in.bits.extra := Cat(a.bits.source, a.bits.size)
+    in.bits.extra :<= a.bits.echo
+
+    val a_extra = in.bits.extra(TLRegisterRouterExtra)
+    a_extra.source := a.bits.source
+    a_extra.size   := a.bits.size
 
     // Invoke the register map builder
     val out = RegMapper(beatBytes, concurrency, undefZero, in, mapping:_*)
@@ -72,12 +89,12 @@ case class TLRegisterNode(
     out.ready := d.ready
 
     // We must restore the size to enable width adapters to work
-    d.bits := edge.AccessAck(
-      toSource    = out.bits.extra(sourceEnd-1, sourceOff),
-      lgSize      = out.bits.extra(sizeEnd-1, sizeOff))
+    val d_extra = out.bits.extra(TLRegisterRouterExtra)
+    d.bits := edge.AccessAck(toSource = d_extra.source, lgSize = d_extra.size)
 
     // avoid a Mux on the data bus by manually overriding two fields
     d.bits.data := out.bits.data
+    d.bits.echo :<= out.bits.extra
     d.bits.opcode := Mux(out.bits.read, TLMessages.AccessAckData, TLMessages.AccessAck)
 
     // Tie off unused channels
@@ -93,7 +110,7 @@ case class TLRegisterNode(
     OMRegister.convert(mapping = mapping:_*)
   }
 
-  def genRegDescsJson(mapping: RegField.Map*) {
+  def genRegDescsJson(mapping: RegField.Map*): Unit = {
     // Dump out the register map for documentation purposes.
     val base = address.head.base
     val baseHex = s"0x${base.toInt.toHexString}"
@@ -114,8 +131,7 @@ case class TLRegisterNode(
   }
 }
 
-// register mapped device from a totally abstract register mapped device.
-
+@deprecated("Use HasTLControlRegMap+HasInterruptSources traits in place of TLRegisterRouter+TLRegBundle+TLRegModule", "rocket-chip 1.3")
 abstract class TLRegisterRouterBase(devname: String, devcompat: Seq[String], val address: AddressSet, interrupts: Int, concurrency: Int, beatBytes: Int, undefZero: Boolean, executable: Boolean)(implicit p: Parameters) extends LazyModule
 {
   // Allow devices to extend the DTS mapping
@@ -128,18 +144,23 @@ abstract class TLRegisterRouterBase(devname: String, devcompat: Seq[String], val
   }
 
   val node = TLRegisterNode(Seq(address), device, "reg/control", concurrency, beatBytes, undefZero, executable)
+  import freechips.rocketchip.interrupts._
   val intnode = IntSourceNode(IntSourcePortSimple(num = interrupts, resources = Seq(Resource(device, "int"))))
 }
 
+@deprecated("TLRegBundleArg is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 case class TLRegBundleArg()(implicit val p: Parameters)
 
+@deprecated("TLRegBundleBase is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 class TLRegBundleBase(arg: TLRegBundleArg) extends Bundle
 {
   implicit val p = arg.p
 }
 
+@deprecated("Use HasTLControlRegMap+HasInterruptSources traits in place of TLRegisterRouter+TLRegBundle+TLRegModule", "rocket-chip 1.3")
 class TLRegBundle[P](val params: P, val arg: TLRegBundleArg) extends TLRegBundleBase(arg)
 
+@deprecated("Use HasTLControlRegMap+HasInterruptSources traits in place of TLRegisterRouter+TLRegBundle+TLRegModule", "rocket-chip 1.3")
 class TLRegModule[P, B <: TLRegBundleBase](val params: P, bundleBuilder: => B, router: TLRegisterRouterBase)
   extends LazyModuleImp(router) with HasRegMap
 {
@@ -149,6 +170,7 @@ class TLRegModule[P, B <: TLRegBundleBase](val params: P, bundleBuilder: => B, r
   def regmap(mapping: RegField.Map*) = router.node.regmap(mapping:_*)
 }
 
+@deprecated("Use HasTLControlRegMap+HasInterruptSources traits in place of TLRegisterRouter+TLRegBundle+TLRegModule", "rocket-chip 1.3")
 class TLRegisterRouter[B <: TLRegBundleBase, M <: LazyModuleImp](
      val base:        BigInt,
      val devname:     String,
@@ -169,10 +191,12 @@ class TLRegisterRouter[B <: TLRegBundleBase, M <: LazyModuleImp](
   lazy val module = moduleBuilder(bundleBuilder(TLRegBundleArg()), this)
 }
 
-// !!! eliminate third trait
-
-/** Mix this trait into a RegisterRouter to be able to attach its register map to a TL bus */
-trait HasTLControlRegMap { this: RegisterRouter[_] =>
+/** Mix HasTLControlRegMap into any subclass of RegisterRouter to gain helper functions for attaching a device control register map to TileLink.
+  * - The intended use case is that controlNode will diplomatically publish a SW-visible device's memory-mapped control registers.
+  * - Use the clock crossing helper controlXing to externally connect controlNode to a TileLink interconnect. 
+  * - Use the mapping helper function regmap to internally fill out the space of device control registers.
+  */
+trait HasTLControlRegMap { this: RegisterRouter =>
   protected val controlNode = TLRegisterNode(
     address = address,
     device = device,
@@ -183,8 +207,11 @@ trait HasTLControlRegMap { this: RegisterRouter[_] =>
     executable = executable)
 
   // Externally, this helper should be used to connect the register control port to a bus
-  val controlXing: TLInwardCrossingHelper = this.crossIn(controlNode)
+  val controlXing: TLInwardClockCrossingHelper = this.crossIn(controlNode)
+
+  // Backwards-compatibility default node accessor with no clock crossing
+  lazy val node: TLInwardNode = controlXing(NoCrossing)
 
   // Internally, this function should be used to populate the control port with registers
-  protected def regmap(mapping: RegField.Map*) { controlNode.regmap(mapping:_*) }
+  protected def regmap(mapping: RegField.Map*): Unit = { controlNode.regmap(mapping:_*) }
 }

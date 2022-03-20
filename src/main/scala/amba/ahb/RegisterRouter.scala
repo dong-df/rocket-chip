@@ -7,8 +7,8 @@ import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.interrupts.{IntSourceNode, IntSourcePortSimple}
-import freechips.rocketchip.util.{HeterogeneousBag, MaskGen}
-import scala.math.{min,max}
+import freechips.rocketchip.util._
+import scala.math.min
 
 case class AHBRegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes: Int = 4, undefZero: Boolean = true, executable: Boolean = false)(implicit valName: ValName)
   extends SinkNode(AHBImpSlave)(Seq(AHBSlavePortParameters(
@@ -28,7 +28,7 @@ case class AHBRegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes:
     val (ahb, _) = this.in(0)
 
     val indexBits = log2Up((address.mask+1)/beatBytes)
-    val params = RegMapperParams(indexBits, beatBytes, 1)
+    val params = RegMapperParams(indexBits, beatBytes)
     val in = Wire(Decoupled(new RegMapperInput(params)))
     val out = RegMapper(beatBytes, concurrency, undefZero, in, mapping:_*)
 
@@ -46,7 +46,6 @@ case class AHBRegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes:
     in.bits.index := d_index
     in.bits.data  := ahb.hwdata
     in.bits.mask  := d_mask
-    in.bits.extra := UInt(0)
 
     when (ahb.hready) { d_phase := Bool(false) }
     ahb.hreadyout := !d_phase || out.valid
@@ -71,21 +70,26 @@ case class AHBRegisterNode(address: AddressSet, concurrency: Int = 0, beatBytes:
 // These convenience methods below combine to make it possible to create a AHB
 // register mapped device from a totally abstract register mapped device.
 
+@deprecated("Use HasAHBControlRegMap+HasInterruptSources traits in place of AHBRegisterRouter+AHBRegBundle+AHBRegModule", "rocket-chip 1.3")
 abstract class AHBRegisterRouterBase(address: AddressSet, interrupts: Int, concurrency: Int, beatBytes: Int, undefZero: Boolean, executable: Boolean)(implicit p: Parameters) extends LazyModule
 {
   val node = AHBRegisterNode(address, concurrency, beatBytes, undefZero, executable)
   val intnode = IntSourceNode(IntSourcePortSimple(num = interrupts))
 }
 
+@deprecated("AHBRegBundleArg is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 case class AHBRegBundleArg()(implicit val p: Parameters)
 
+@deprecated("AHBRegBundleBase is no longer necessary, use IO(...) to make any additional IOs", "rocket-chip 1.3")
 class AHBRegBundleBase(arg: AHBRegBundleArg) extends Bundle
 {
   implicit val p = arg.p
 }
 
+@deprecated("Use HasAHBControlRegMap+HasInterruptSources traits in place of AHBRegisterRouter+AHBRegBundle+AHBRegModule", "rocket-chip 1.3")
 class AHBRegBundle[P](val params: P, arg: AHBRegBundleArg) extends AHBRegBundleBase(arg)
 
+@deprecated("Use HasAHBControlRegMap+HasInterruptSources traits in place of AHBRegisterRouter+AHBRegBundle+AHBRegModule", "rocket-chip 1.3")
 class AHBRegModule[P, B <: AHBRegBundleBase](val params: P, bundleBuilder: => B, router: AHBRegisterRouterBase)
   extends LazyModuleImp(router) with HasRegMap
 {
@@ -94,6 +98,7 @@ class AHBRegModule[P, B <: AHBRegBundleBase](val params: P, bundleBuilder: => B,
   def regmap(mapping: RegField.Map*) = router.node.regmap(mapping:_*)
 }
 
+@deprecated("Use HasAHBControlRegMap+HasInterruptSources traits in place of AHBRegisterRouter+AHBRegBundle+AHBRegModule", "rocket-chip 1.3")
 class AHBRegisterRouter[B <: AHBRegBundleBase, M <: LazyModuleImp]
    (val base: BigInt, val interrupts: Int = 0, val size: BigInt = 4096, val concurrency: Int = 0, val beatBytes: Int = 4, undefZero: Boolean = true, executable: Boolean = false)
    (bundleBuilder: AHBRegBundleArg => B)
@@ -107,7 +112,7 @@ class AHBRegisterRouter[B <: AHBRegBundleBase, M <: LazyModuleImp]
 }
 
 /** Mix this trait into a RegisterRouter to be able to attach its register map to an AXI4 bus */
-trait HasAHBControlRegMap { this: RegisterRouter[_] =>
+trait HasAHBControlRegMap { this: RegisterRouter =>
   // Externally, this node should be used to connect the register control port to a bus
   val controlNode = AHBRegisterNode(
     address = address.head,
@@ -116,6 +121,9 @@ trait HasAHBControlRegMap { this: RegisterRouter[_] =>
     undefZero = undefZero,
     executable = executable)
 
+  // Backwards-compatibility default node accessor with no clock crossing
+  lazy val node: AHBRegisterNode = controlNode
+
   // Internally, this function should be used to populate the control port with registers
-  protected def regmap(mapping: RegField.Map*) { controlNode.regmap(mapping:_*) }
+  protected def regmap(mapping: RegField.Map*): Unit = { controlNode.regmap(mapping:_*) }
 }

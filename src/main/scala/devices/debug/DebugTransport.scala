@@ -7,8 +7,8 @@ import chisel3.util._
 
 import freechips.rocketchip.config._
 import freechips.rocketchip.jtag._
-import freechips.rocketchip.util._
-import freechips.rocketchip.util.property._
+import freechips.rocketchip.util.property
+
 
 case class JtagDTMConfig (
   idcodeVersion    : Int,      // chosen by manuf.
@@ -40,7 +40,6 @@ class DMIAccessUpdate(addrBits: Int) extends Bundle {
   val data = UInt(DMIConsts.dmiDataSize.W)
   val op = UInt(DMIConsts.dmiOpSize.W)
 
-  override def cloneType = new DMIAccessUpdate(addrBits).asInstanceOf[this.type]
 }
 
 class DMIAccessCapture(addrBits: Int) extends Bundle {
@@ -48,7 +47,6 @@ class DMIAccessCapture(addrBits: Int) extends Bundle {
   val data = UInt(DMIConsts.dmiDataSize.W)
   val resp = UInt(DMIConsts.dmiRespSize.W)
 
-  override def cloneType = new DMIAccessCapture(addrBits).asInstanceOf[this.type]
 
 }
 
@@ -65,24 +63,30 @@ class DTMInfo extends Bundle {
 /** A wrapper around JTAG providing a reset signal and manufacturer id. */
 class SystemJTAGIO extends Bundle {
   val jtag = Flipped(new JTAGIO(hasTRSTn = false))
-  val reset = Input(Bool())
+  val reset = Input(Reset())
   val mfr_id = Input(UInt(11.W))
   val part_number = Input(UInt(16.W))
   val version = Input(UInt(4.W))
 }
 
+// Use the Chisel Name macro due to the bulk of this being inside a withClockAndReset block
 class DebugTransportModuleJTAG(debugAddrBits: Int, c: JtagDTMConfig)
-  (implicit val p: Parameters) extends Module  {
+  (implicit val p: Parameters) extends RawModule  {
 
   val io = IO(new Bundle {
+    val jtag_clock = Input(Clock())
+    val jtag_reset = Input(Reset()) // This is internally converted to AsyncReset.
+                                    // We'd prefer to call this AsyncReset, but that's a fairly
+                                    // invasive API change.
     val dmi = new DMIIO()(p)
     val jtag = Flipped(new JTAGIO(hasTRSTn = false)) // TODO: re-use SystemJTAGIO here?
-    val jtag_reset = Input(Bool())
     val jtag_mfr_id = Input(UInt(11.W))
     val jtag_part_number = Input(UInt(16.W))
     val jtag_version = Input(UInt(4.W))
-    val fsmReset = Output(Bool())
   })
+  val rf_reset = IO(Input(Reset()))    // RF transform
+
+  withClockAndReset(io.jtag_clock, io.jtag_reset.asAsyncReset) {
 
   //--------------------------------------------------------
   // Reg and Wire Declarations
@@ -171,12 +175,9 @@ class DebugTransportModuleJTAG(debugAddrBits: Int, c: JtagDTMConfig)
   // Especially for the first request, we must consider dtmResp.valid,
   // so that we don't consider junk in the FIFO to be an error response.
   // The current specification says that any non-zero response is an error.
-  // But there is actually no case in the current design where you SHOULD get an error,
-  // as we haven't implemented Bus Masters or Serial Ports, which are the only cases errors
-  // can occur.
   nonzeroResp := stickyNonzeroRespReg | (io.dmi.resp.valid & (io.dmi.resp.bits.resp =/= 0.U))
-  assert(!nonzeroResp, "There is no reason to get a non zero response in the current system.");
-  assert(!stickyNonzeroRespReg, "There is no reason to have a sticky non zero response in the current system.");
+  property.cover(!nonzeroResp, "Should see a non-zero response (e.g. when accessing most DM registers when dmactive=0)")
+  property.cover(!stickyNonzeroRespReg, "Should see a sticky non-zero response (e.g. when accessing most DM registers when dmactive=0)")
 
   busyResp.addr  := 0.U
   busyResp.resp  := ~(0.U(DMIConsts.dmiRespSize.W)) // Generalizing busy to 'all-F'
@@ -228,14 +229,14 @@ class DebugTransportModuleJTAG(debugAddrBits: Int, c: JtagDTMConfig)
       dmiAccessChain.io.capture.capture & !busy)
 
   // incorrect operation - not enough time was spent in JTAG Idle state after DMI Write
-  cover(dmiReqReg.op === DMIConsts.dmi_OP_WRITE & dmiAccessChain.io.capture.capture & busy, "Not enough Idle after DMI Write");
+  property.cover(dmiReqReg.op === DMIConsts.dmi_OP_WRITE & dmiAccessChain.io.capture.capture & busy, "Not enough Idle after DMI Write");
   // correct operation - enough time was spent in JTAG Idle state after DMI Write
-  cover(dmiReqReg.op === DMIConsts.dmi_OP_WRITE & dmiAccessChain.io.capture.capture & !busy, "Enough Idle after DMI Write");
+  property.cover(dmiReqReg.op === DMIConsts.dmi_OP_WRITE & dmiAccessChain.io.capture.capture & !busy, "Enough Idle after DMI Write");
 
   // incorrect operation - not enough time was spent in JTAG Idle state after DMI Read
-  cover(dmiReqReg.op === DMIConsts.dmi_OP_READ & dmiAccessChain.io.capture.capture & busy, "Not enough Idle after DMI Read");
+  property.cover(dmiReqReg.op === DMIConsts.dmi_OP_READ & dmiAccessChain.io.capture.capture & busy, "Not enough Idle after DMI Read");
   // correct operation - enough time was spent in JTAG Idle state after DMI Read
-  cover(dmiReqReg.op === DMIConsts.dmi_OP_READ & dmiAccessChain.io.capture.capture & !busy, "Enough Idle after DMI Read");
+  property.cover(dmiReqReg.op === DMIConsts.dmi_OP_READ & dmiAccessChain.io.capture.capture & !busy, "Enough Idle after DMI Read");
 
   io.dmi.req.valid := dmiReqValidReg
 
@@ -260,11 +261,17 @@ class DebugTransportModuleJTAG(debugAddrBits: Int, c: JtagDTMConfig)
   tapIO.idcode.get := idcode
   tapIO.jtag <> io.jtag
 
-  tapIO.control.jtag_reset := io.jtag_reset
+  tapIO.control.jtag_reset := io.jtag_reset.asAsyncReset
 
   //--------------------------------------------------------
-  // Reset Generation (this is fed back to us by the instantiating module,
-  // and is used to reset the debug registers).
+  // TAP Test-Logic-Reset state synchronously resets the debug registers.
 
-  io.fsmReset := tapIO.output.reset
-}
+  when (tapIO.output.tapIsInTestLogicReset) {
+    busyReg := false.B
+    stickyBusyReg := false.B
+    stickyNonzeroRespReg := false.B
+    downgradeOpReg := false.B
+    dmiReqValidReg := false.B
+  }
+
+}}

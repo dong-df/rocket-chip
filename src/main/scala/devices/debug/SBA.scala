@@ -4,19 +4,18 @@ package freechips.rocketchip.devices.debug.systembusaccess
 
 import chisel3._
 import chisel3.util._
+import freechips.rocketchip.amba._
 import freechips.rocketchip.config._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.regmapper._
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util._
-import freechips.rocketchip.util.property._
+import freechips.rocketchip.util.property
 import freechips.rocketchip.devices.debug._
 
 object SystemBusAccessState extends scala.Enumeration {
    type SystemBusAccessState = Value
    val Idle, SBReadRequest, SBWriteRequest, SBReadResponse, SBWriteResponse = Value
-}
-import SystemBusAccessState._ 
+} 
 
 object SBErrorCode extends scala.Enumeration {
   type SBErrorCode = Value
@@ -27,7 +26,6 @@ object SBErrorCode extends scala.Enumeration {
   val BadAccess  = Value(4)
   val OtherError = Value(7)
 }
-import SBErrorCode._
 
 object SystemBusAccessModule
 {
@@ -35,7 +33,6 @@ object SystemBusAccessModule
     (Seq[RegField], Seq[Seq[RegField]], Seq[Seq[RegField]]) =
   {
     import SBErrorCode._
-    import DMI_RegAddrs._
 
     val cfg = p(DebugModuleKey).get
 
@@ -128,7 +125,7 @@ object SystemBusAccessModule
       }
     }
 
-    sb2tl.module.io.addrIn := Mux(sb2tl.module.io.rdEn,
+    sb2tl.module.io.addrIn := Mux(SBADDRESSWrEn(0),
       Cat(Cat(SBADDRESSFieldsReg.drop(1).reverse), SBADDRESSWrData(0)),
       Cat(SBADDRESSFieldsReg.reverse))
     anyAddressWrEn         := SBADDRESSWrEn.reduce(_ || _)
@@ -199,7 +196,6 @@ object SystemBusAccessModule
     sb2tl.module.io.wrEn     := dmAuthenticated && tryWrEn && !SBCSFieldsReg.sbbusy && !SBCSFieldsReg.sbbusyerror && !SBCSRdData.sberror && !sbAccessError && !sbAlignmentError
     sb2tl.module.io.rdEn     := dmAuthenticated && tryRdEn && !SBCSFieldsReg.sbbusy && !SBCSFieldsReg.sbbusyerror && !SBCSRdData.sberror && !sbAccessError && !sbAlignmentError
     sb2tl.module.io.sizeIn   := SBCSFieldsReg.sbaccess
-    sb2tl.module.io.dmactive := dmactive
 
     val sbBusy = (sb2tl.module.io.sbStateOut =/= SystemBusAccessState.Idle.id.U)
 
@@ -244,19 +240,19 @@ object SystemBusAccessModule
       SBCSRdData := 0.U.asTypeOf(new SBCSFields())
     }
 
-    cover(SBCSFieldsReg.sbbusyerror,    "SBCS Cover", "sberror set")
-    cover(SBCSFieldsReg.sbbusy === 3.U, "SBCS Cover", "sbbusyerror alignment error")
+    property.cover(SBCSFieldsReg.sbbusyerror,    "SBCS Cover", "sberror set")
+    property.cover(SBCSFieldsReg.sbbusy === 3.U, "SBCS Cover", "sbbusyerror alignment error")
 
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 0.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "8-bit access")
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 1.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "16-bit access")
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 2.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "32-bit access")
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 3.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "64-bit access")
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 4.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "128-bit access")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 0.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "8-bit access")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 1.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "16-bit access")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 2.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "32-bit access")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 3.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "64-bit access")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess === 4.U && !sbAccessError && !sbAlignmentError, "SBCS Cover", "128-bit access")
 
-    cover(SBCSFieldsReg.sbautoincrement && SBCSFieldsReg.sbbusy,  "SBCS Cover", "Access with autoincrement set")
-    cover(!SBCSFieldsReg.sbautoincrement && SBCSFieldsReg.sbbusy, "SBCS Cover", "Access without autoincrement set")
+    property.cover(SBCSFieldsReg.sbautoincrement && SBCSFieldsReg.sbbusy,  "SBCS Cover", "Access with autoincrement set")
+    property.cover(!SBCSFieldsReg.sbautoincrement && SBCSFieldsReg.sbbusy, "SBCS Cover", "Access without autoincrement set")
 
-    cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess > 4.U, "SBCS Cover", "Invalid sbaccess value")
+    property.cover((sb2tl.module.io.wrEn || sb2tl.module.io.rdEn) && SBCSFieldsReg.sbaccess > 4.U, "SBCS Cover", "Invalid sbaccess value")
 
     (sbcsfields, sbaddrfields, sbdatafields)
   }
@@ -266,7 +262,9 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
 
   val cfg = p(DebugModuleKey).get
 
-  val node = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters("debug")))))
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(
+    clients = Seq(TLMasterParameters.v1("debug")),
+    requestFields = Seq(AMBAProtField()))))
 
   lazy val module = new LazyModuleImp(this) {
     val io = IO(new Bundle {
@@ -275,7 +273,6 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
       val addrIn       = Input(UInt(128.W)) // TODO: Parameterize these widths
       val dataIn       = Input(UInt(128.W))
       val sizeIn       = Input(UInt(3.W))
-      val dmactive     = Input(Bool())
       val rdLegal      = Output(Bool())
       val wrLegal      = Output(Bool())
       val rdDone       = Output(Bool())
@@ -285,6 +282,7 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
       val rdLoad       = Output(Vec(cfg.maxSupportedSBAccess/8, Bool()))
       val sbStateOut   = Output(UInt(log2Ceil(SystemBusAccessState.maxId).W))
     })
+    val rf_reset       = IO(Input(Reset()))
 
     import SystemBusAccessState._
  
@@ -320,6 +318,16 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
     when(sbState === SBReadRequest.id.U) { tl.a.bits :=  gbits  }
     .otherwise                           { tl.a.bits := pfbits  }
 
+    tl.a.bits.user.lift(AMBAProt).foreach { x =>
+      x.bufferable := false.B
+      x.modifiable := false.B
+      x.readalloc  := false.B
+      x.writealloc := false.B
+      x.privileged := true.B
+      x.secure     := true.B
+      x.fetch      := false.B
+    }
+
     val respError = d.bits.denied || d.bits.corrupt
     io.respError := respError
 
@@ -334,9 +342,7 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
     }
 
     // --- State Machine to interface with TileLink ---
-    when(~io.dmactive){
-      sbState := Idle.id.U
-    }.elsewhen (sbState === Idle.id.U){
+    when (sbState === Idle.id.U){
       sbState := Mux(io.rdEn && io.rdLegal, SBReadRequest.id.U,
                  Mux(io.wrEn && io.wrLegal, SBWriteRequest.id.U, sbState))
     }.elsewhen (sbState === SBReadRequest.id.U){
@@ -366,14 +372,14 @@ class SBToTL(implicit p: Parameters) extends LazyModule {
             sbState === SBReadResponse.id.U ||          
             sbState === SBWriteResponse.id.U, "SBA state machine in undefined state")
 
-    cover (sbState === Idle.id.U,            "SBA State Cover", "SBA Access Idle")
-    cover (sbState === SBReadRequest.id.U,   "SBA State Cover", "SBA Access Read Req")
-    cover (sbState === SBWriteRequest.id.U,  "SBA State Cover", "SBA Access Write Req")
-    cover (sbState === SBReadResponse.id.U,  "SBA State Cover", "SBA Access Read Resp")
-    cover (sbState === SBWriteResponse.id.U, "SBA State Cover", "SBA Access Write Resp")
+    property.cover (sbState === Idle.id.U,            "SBA State Cover", "SBA Access Idle")
+    property.cover (sbState === SBReadRequest.id.U,   "SBA State Cover", "SBA Access Read Req")
+    property.cover (sbState === SBWriteRequest.id.U,  "SBA State Cover", "SBA Access Write Req")
+    property.cover (sbState === SBReadResponse.id.U,  "SBA State Cover", "SBA Access Read Resp")
+    property.cover (sbState === SBWriteResponse.id.U, "SBA State Cover", "SBA Access Write Resp")
 
-    cover (io.rdEn && !io.rdLegal, "SB Legality Cover", "SBA Rd Address Illegal")
-    cover (io.wrEn && !io.wrLegal, "SB Legality Cover", "SBA Wr Address Illegal")
+    property.cover (io.rdEn && !io.rdLegal, "SB Legality Cover", "SBA Rd Address Illegal")
+    property.cover (io.wrEn && !io.wrLegal, "SB Legality Cover", "SBA Wr Address Illegal")
  
   }
 }

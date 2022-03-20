@@ -3,7 +3,6 @@
 package freechips.rocketchip.tilelink
 
 import Chisel._
-import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
@@ -35,7 +34,7 @@ case class ReadExpectPattern(address: BigInt, size: Int, data: BigInt) extends P
 
 class TLPatternPusher(name: String, pattern: Seq[Pattern])(implicit p: Parameters) extends LazyModule
 {
-  val node = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters(name = name)))))
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(Seq(TLMasterParameters.v1(name = name)))))
 
   lazy val module = new LazyModuleImp(this) {
     val io = IO(new Bundle {

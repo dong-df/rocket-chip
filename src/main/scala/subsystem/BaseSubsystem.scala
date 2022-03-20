@@ -5,20 +5,20 @@ package freechips.rocketchip.subsystem
 import Chisel._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.diplomaticobjectmodel.HasLogicalTreeNode
 import freechips.rocketchip.diplomaticobjectmodel.logicaltree._
+import freechips.rocketchip.prci._
 import freechips.rocketchip.tilelink.TLBusWrapper
 import freechips.rocketchip.util._
 
+case object SubsystemDriveAsyncClockGroupsKey extends Field[Option[ClockGroupDriverParameters]](Some(ClockGroupDriverParameters(1)))
+case object AsyncClockGroupsKey extends Field[ClockGroupEphemeralNode](ClockGroupEphemeralNode()(ValName("clock_sources")))
+case class TLNetworkTopologyLocated(where: HierarchicalLocation) extends Field[Seq[CanInstantiateWithinContextThatHasTileLinkLocations with CanConnectWithinContextThatHasTileLinkLocations]]
+case class TLManagerViewpointLocated(where: HierarchicalLocation) extends Field[Location[TLBusWrapper]](SBUS)
 
-case object SystemBusKey extends Field[SystemBusParams]
-case object FrontBusKey extends Field[FrontBusParams]
-case object PeripheryBusKey extends Field[PeripheryBusParams]
-case object ControlBusKey extends Field[PeripheryBusParams]
-case object MemoryBusKey extends Field[MemoryBusParams]
-case object BankedL2Key extends Field(BankedL2Params())
-
-case object BuildSystemBus extends Field[Parameters => SystemBus](p => new SystemBus(p(SystemBusKey))(p))
+class HierarchicalLocation(override val name: String) extends Location[LazyScope](name)
+case object InTile extends HierarchicalLocation("InTile")
+case object InSubsystem extends HierarchicalLocation("InSubsystem")
+case object InSystem extends HierarchicalLocation("InSystem")
 
 /** BareSubsystem is the root class for creating a subsystem */
 abstract class BareSubsystem(implicit p: Parameters) extends LazyModule with BindingScope {
@@ -36,53 +36,70 @@ abstract class BareSubsystemModuleImp[+L <: BareSubsystem](_outer: L) extends La
   println(outer.dts)
 }
 
+trait SubsystemResetScheme
+case object ResetSynchronous extends SubsystemResetScheme
+case object ResetAsynchronous extends SubsystemResetScheme
+case object ResetAsynchronousFull extends SubsystemResetScheme
 
-trait HasBusAttachmentFunction {
-  type BusAttachmentFunction = PartialFunction[BaseSubsystemBusAttachment, TLBusWrapper]
-  def attach: BusAttachmentFunction
+case object SubsystemResetSchemeKey extends Field[SubsystemResetScheme](ResetSynchronous)
+
+/** Concrete attachment points for PRCI-related signals.
+  * These aren't actually very configurable, yet.
+  */
+trait HasConfigurablePRCILocations { this: HasPRCILocations =>
+  val ibus = LazyModule(new InterruptBusWrapper)
+  implicit val asyncClockGroupsNode = p(AsyncClockGroupsKey)
+  val clock_sources: ModuleValue[RecordMap[ClockBundle]] =
+    p(SubsystemDriveAsyncClockGroupsKey)
+      .map(_.drive(asyncClockGroupsNode))
+      .getOrElse(InModuleBody { RecordMap[ClockBundle]() })
 }
 
-/** This trait contains the cases matched in baseBusAttachmentFunc below.
-  * Extend/override them to offer novel attachment locations in subclasses of BaseSubsystem.
-  */
-trait BaseSubsystemBusAttachment
-case object SBUS extends BaseSubsystemBusAttachment
-case object PBUS extends BaseSubsystemBusAttachment
-case object FBUS extends BaseSubsystemBusAttachment
-case object MBUS extends BaseSubsystemBusAttachment
-case object CBUS extends BaseSubsystemBusAttachment
+/** Look up the topology configuration for the TL buses located within this layer of the hierarchy */
+trait HasConfigurableTLNetworkTopology { this: HasTileLinkLocations =>
+  val location: HierarchicalLocation
 
-/** Base Subsystem class with no peripheral devices or ports added */
-abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem 
-  with HasLogicalTreeNode with HasBusAttachmentFunction {
+  // Calling these functions populates tlBusWrapperLocationMap and connects the locations to each other.
+  val topology = p(TLNetworkTopologyLocated(location))
+  topology.map(_.instantiate(this))
+  topology.foreach(_.connect(this))
 
+  // This is used lazily at DTS binding time to get a view of the network
+  lazy val topManagers = tlBusWrapperLocationMap(p(TLManagerViewpointLocated(location))).unifyManagers
+}
+
+/** Base Subsystem class with no peripheral devices, ports or cores added yet */
+abstract class BaseSubsystem(val location: HierarchicalLocation = InSubsystem)
+                            (implicit p: Parameters)
+  extends BareSubsystem
+  with Attachable
+  with HasConfigurablePRCILocations
+  with HasConfigurableTLNetworkTopology
+{
   override val module: BaseSubsystemModuleImp[BaseSubsystem]
 
-  // These are wrappers around the standard buses available in all subsytems, where
-  // peripherals, tiles, ports, and other masters and slaves can attach themselves.
-  val ibus = new InterruptBusWrapper()
-  val sbus = LazyModule(p(BuildSystemBus)(p))
-  val pbus = LazyModule(new PeripheryBus(p(PeripheryBusKey), "subsystem_pbus"))
-  val fbus = LazyModule(new FrontBus(p(FrontBusKey)))
-  val mbus = LazyModule(new MemoryBus(p(MemoryBusKey)))
-  val cbus = LazyModule(new PeripheryBus(p(ControlBusKey), "subsystem_cbus"))
+  // TODO must there really always be an "sbus"?
+  val sbus = tlBusWrapperLocationMap(SBUS)
+  tlBusWrapperLocationMap.lift(SBUS).map { _.clockGroupNode := asyncClockGroupsNode }
 
-  def attach: BusAttachmentFunction = {
-    case SBUS => sbus
-    case PBUS => pbus
-    case FBUS => fbus
-    case MBUS => mbus
-    case CBUS => cbus
-  }
+  // TODO: Preserve legacy implicit-clock behavior for IBUS for now. If binding
+  // a PLIC to the CBUS, ensure it is synchronously coupled to the SBUS.
+  ibus.clockNode := sbus.fixedClockNode
+
+  // TODO deprecate these public members to see where users are manually hardcoding a particular bus that might actually not exist in a certain dynamic topology
+  val pbus = tlBusWrapperLocationMap.lift(PBUS).getOrElse(sbus)
+  val fbus = tlBusWrapperLocationMap.lift(FBUS).getOrElse(sbus)
+  val mbus = tlBusWrapperLocationMap.lift(MBUS).getOrElse(sbus)
+  val cbus = tlBusWrapperLocationMap.lift(CBUS).getOrElse(sbus)
 
   // Collect information for use in DTS
-  lazy val topManagers = sbus.unifyManagers
   ResourceBinding {
     val managers = topManagers
     val max = managers.flatMap(_.address).map(_.max).max
     val width = ResourceInt((log2Ceil(max)+31) / 32)
     val model = p(DTSModel)
     val compat = p(DTSCompat)
+    var hertz = p(DTSTimebase) // add for timebase-frequency
     val devCompat = (model +: compat).map(s => ResourceString(s + "-dev"))
     val socCompat = (model +: compat).map(s => ResourceString(s + "-soc"))
     devCompat.foreach { Resource(ResourceAnchors.root, "compat").bind(_) }
@@ -91,6 +108,7 @@ abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem
     Resource(ResourceAnchors.root, "width").bind(width)
     Resource(ResourceAnchors.soc,  "width").bind(width)
     Resource(ResourceAnchors.cpus, "width").bind(ResourceInt(1))
+    Resource(ResourceAnchors.cpus, "hertz").bind(ResourceInt(hertz))
 
     managers.foreach { case manager =>
       val value = manager.toResource
@@ -101,6 +119,16 @@ abstract class BaseSubsystem(implicit p: Parameters) extends BareSubsystem
   }
 
   lazy val logicalTreeNode = new SubsystemLogicalTreeNode()
+
+  tlBusWrapperLocationMap.values.foreach { bus =>
+    val builtIn = bus.builtInDevices
+    builtIn.errorOpt.foreach { error =>
+      LogicalModuleTree.add(logicalTreeNode, error.logicalTreeNode)
+    }
+    builtIn.zeroOpt.foreach { zero =>
+      LogicalModuleTree.add(logicalTreeNode, zero.logicalTreeNode)
+    }
+  }
 }
 
 

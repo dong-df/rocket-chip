@@ -6,7 +6,6 @@ import chisel3._
 import chisel3.util._
 import freechips.rocketchip.config._
 import freechips.rocketchip.util._
-import freechips.rocketchip.util.property._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 
@@ -43,7 +42,6 @@ class DMIReq(addrBits : Int) extends Bundle {
   val data = UInt(DMIConsts.dmiDataSize.W)
   val op   = UInt(DMIConsts.dmiOpSize.W)
 
-  override def cloneType = new DMIReq(addrBits).asInstanceOf[this.type]
 }
 
 /** Structure to define the contents of a Debug Bus Response
@@ -71,7 +69,7 @@ class DMIIO(implicit val p: Parameters) extends ParameterizedBundle()(p) {
 class ClockedDMIIO(implicit val p: Parameters) extends ParameterizedBundle()(p){
   val dmi      = new DMIIO()(p)
   val dmiClock = Output(Clock())
-  val dmiReset = Output(Bool())
+  val dmiReset = Output(Reset())
 }
 
 /** Convert DMI to TL. Avoids using special DMI synchronizers and register accesses
@@ -79,12 +77,11 @@ class ClockedDMIIO(implicit val p: Parameters) extends ParameterizedBundle()(p){
   */
 
 class DMIToTL(implicit p: Parameters) extends LazyModule {
-
-  // This master can only produce:
-  // emitsGet = TransferSizes(4, 4),
-  // emitsPutFull = TransferSizes(4, 4),
-  // emitsPutPartial = TransferSizes(4, 4)
-  val node = TLClientNode(Seq(TLClientPortParameters(Seq(TLClientParameters("debug")))))
+  val node = TLClientNode(Seq(TLMasterPortParameters.v2(Seq(TLMasterParameters.v2(
+    name = "debug",
+    emits = TLMasterToSlaveTransferSizes(
+      get = TransferSizes(4,4),
+      putFull = TransferSizes(4,4)))))))
 
   lazy val module = new LazyModuleImp(this) {
     val io = IO(new Bundle {
@@ -100,13 +97,13 @@ class DMIToTL(implicit p: Parameters) extends LazyModule {
     val (_,  gbits) = edge.Get(src, addr, size)
     val (_, pfbits) = edge.Put(src, addr, size, io.dmi.req.bits.data)
 
-    // We force DMI NOPs to go to CONTROL register because
+    // We force DMI NOPs to write to read-only HARTINFO register because
     // Inner  may be in reset / not have a clock,
     // so we force address to be the one that goes to Outer.
     // Therefore for a NOP we don't really need to pay the penalty to go
     // across the CDC.
 
-    val (_, nbits)  = edge.Put(src, toAddress = (DMI_RegAddrs.DMI_DMCONTROL << 2).U, size, data=0.U, mask = 0.U)
+    val (_, nbits)  = edge.Put(src, toAddress = (DMI_RegAddrs.DMI_HARTINFO << 2).U, size, data=0.U)
 
     when (io.dmi.req.bits.op === DMIConsts.dmi_OP_WRITE)       { tl.a.bits := pfbits
     }.elsewhen  (io.dmi.req.bits.op === DMIConsts.dmi_OP_READ) { tl.a.bits := gbits

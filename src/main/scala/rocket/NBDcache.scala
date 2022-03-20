@@ -48,7 +48,6 @@ class WritebackReq(params: TLBundleParameters)(implicit p: Parameters) extends L
   val way_en = Bits(width = nWays)
   val voluntary = Bool()
 
-  override def cloneType = new WritebackReq(params)(p).asInstanceOf[this.type]
 }
 
 class IOMSHR(id: Int)(implicit edge: TLEdgeOut, p: Parameters) extends L1HellaCacheModule()(p) {
@@ -673,7 +672,7 @@ class DataArray(implicit p: Parameters) extends L1HellaCacheModule()(p) {
   io.write.ready := Bool(true)
 }
 
-class NonBlockingDCache(hartid: Int)(implicit p: Parameters) extends HellaCache(hartid)(p) {
+class NonBlockingDCache(staticIdForMetadataUseOnly: Int)(implicit p: Parameters) extends HellaCache(staticIdForMetadataUseOnly)(p) {
   override lazy val module = new NonBlockingDCacheModule(this)
   override def getOMSRAMs(): Seq[OMSRAM] = Nil // this is just a dummy value and that we need to eventually fix it
 }
@@ -718,7 +717,7 @@ class NonBlockingDCacheModule(outer: NonBlockingDCache) extends HellaCacheModule
   // check for unsupported operations
   assert(!s1_valid || !s1_req.cmd.isOneOf(M_PWR))
 
-  val dtlb = Module(new TLB(false, log2Ceil(coreDataBytes), TLBConfig(nTLBEntries)))
+  val dtlb = Module(new TLB(false, log2Ceil(coreDataBytes), TLBConfig(nTLBSets, nTLBWays)))
   io.ptw <> dtlb.io.ptw
   dtlb.io.kill := io.cpu.s2_kill
   dtlb.io.req.valid := s1_valid && !io.cpu.s1_kill && s1_readwrite
@@ -726,6 +725,8 @@ class NonBlockingDCacheModule(outer: NonBlockingDCache) extends HellaCacheModule
   dtlb.io.req.bits.vaddr := s1_req.addr
   dtlb.io.req.bits.size := s1_req.size
   dtlb.io.req.bits.cmd := s1_req.cmd
+  dtlb.io.req.bits.prv := s1_req.dprv
+  dtlb.io.req.bits.v := s1_req.dv
   when (!dtlb.io.req.ready && !io.cpu.req.bits.phys) { io.cpu.req.ready := Bool(false) }
 
   dtlb.io.sfence.valid := s1_valid && !io.cpu.s1_kill && s1_sfence

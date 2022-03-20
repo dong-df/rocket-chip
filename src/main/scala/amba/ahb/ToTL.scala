@@ -3,20 +3,29 @@
 package freechips.rocketchip.amba.ahb
 
 import Chisel._
+import freechips.rocketchip.amba._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
-import freechips.rocketchip.util.MaskGen
+import freechips.rocketchip.util._
 
 case class AHBToTLNode()(implicit valName: ValName) extends MixedAdapterNode(AHBImpSlave, TLImp)(
-  dFn = { case AHBMasterPortParameters(masters) =>
-    TLClientPortParameters(clients = masters.map { m =>
-      // AHB fixed length transfer size maximum is 16384 = 1024 * 16 bits, hsize is capped at 111 = 1024 bit transfer size and hburst is capped at 111 = 16 beat burst
-      // This master can only produce:
-      // emitsGet = TransferSizes(1, 2048),
-      // emitsPutFull = TransferSizes(1, 2048)
-      TLClientParameters(name = m.name, nodePath = m.nodePath)
-    })
+  dFn = { case mp =>
+    TLMasterPortParameters.v2(
+      masters = mp.masters.map { m =>
+        // This value should be constrained by a data width parameter that flows from masters to slaves
+        // AHB fixed length transfer size maximum is 16384 = 1024 * 16 bits, hsize is capped at 111 = 1024 bit transfer size and hburst is capped at 111 = 16 beat burst
+          TLMasterParameters.v2(
+            name     = m.name,
+            nodePath = m.nodePath,
+            emits    = TLMasterToSlaveTransferSizes(
+                       get     = TransferSizes(1, 2048),
+                       putFull = TransferSizes(1, 2048)
+                       )
+          )
+      },
+      requestFields = AMBAProtField() +: mp.requestFields,
+      responseKeys  = mp.responseKeys)
   },
   uFn = { mp => AHBSlavePortParameters(
     slaves = mp.managers.map { m =>
@@ -36,8 +45,10 @@ case class AHBToTLNode()(implicit valName: ValName) extends MixedAdapterNode(AHB
         nodePath      = m.nodePath,
         supportsWrite = adjust(m.supportsPutFull),
         supportsRead  = adjust(m.supportsGet))},
-    beatBytes = mp.beatBytes,
-    lite      = true)
+    beatBytes  = mp.beatBytes,
+    lite       = true,
+    responseFields = mp.responseFields,
+    requestKeys    = mp.requestKeys.filter(_ != AMBAProt))
   })
 
 class AHBToTL()(implicit p: Parameters) extends LazyModule
@@ -54,7 +65,8 @@ class AHBToTL()(implicit p: Parameters) extends LazyModule
       val d_fail  = RegInit(Bool(false))
       val d_write = RegInit(Bool(false))
       val d_addr  = Reg(in.haddr)
-      val d_size  = Reg(in.hsize)
+      val d_size  = Reg(out.a.bits.size)
+      val d_user  = Reg(BundleMap(edgeOut.bundle.requestFields))
 
       when (out.d.valid) { d_recv  := Bool(false) }
       when (out.a.ready) { d_send  := Bool(false) }
@@ -98,6 +110,16 @@ class AHBToTL()(implicit p: Parameters) extends LazyModule
           d_write := in.hwrite
           d_addr  := in.haddr
           d_size  := Mux(a_burst_ok, a_burst_size, in.hsize)
+          d_user  :<= in.hauser
+          d_user.lift(AMBAProt).foreach { x =>
+            x.fetch      := !in.hprot(0)
+            x.privileged :=  in.hprot(1)
+            x.bufferable :=  in.hprot(2)
+            x.modifiable :=  in.hprot(3)
+            x.secure     := false.B
+            x.readalloc  :=  in.hprot(3)
+            x.writealloc :=  in.hprot(3)
+          }
         }
       }
 
@@ -110,16 +132,25 @@ class AHBToTL()(implicit p: Parameters) extends LazyModule
       out.a.bits.data    := in.hwdata
       out.a.bits.mask    := MaskGen(d_addr, d_size, beatBytes)
       out.a.bits.corrupt := Bool(false)
+      out.a.bits.user    :<= d_user
 
       out.d.ready  := d_recv // backpressure AccessAckData arriving faster than AHB beats
 
-      // NOTE: on failure, we present the read result on the hreadyout LOW cycle
-      // This means that if you latch hrdata from a failure, the result is garbage.
-      // To fix this would require a bus-wide register, and the AHB spec says this:
-      // "A slave only has to provide valid data when a transfer completes with an OKAY
-      //  response. ERROR responses do not require valid read data."
-      // Therefore, we choose to accept this slight TL-AHB infidelity.
-      in.hrdata := out.d.bits.data
+      // AHB failed reads take two cycles.
+      // We must accept the D-channel beat on the first cycle, as otherwise
+      // the failure might be legally retracted on the second cycle.
+      // Although the AHB spec says:
+      //   "A slave only has to provide valid data when a transfer completes with
+      //    an OKAY response. ERROR responses do not require valid read data."
+      // We choose, nevertheless, to provide the read data for the failed request.
+      // Unfortunately, this comes at the cost of a bus-wide register.
+      in.hrdata := out.d.bits.data holdUnless d_recv
+      in.hduser :<= out.d.bits.user
+
+      // Double-check that the above register has the intended effect since
+      // this is an additional requirement not tested by third-party VIP.
+      // hresp(0) && !hreadyout => next cycle has same hrdata value
+      assert (!RegNext(in.hresp(0) && !in.hreadyout, false.B) || RegNext(in.hrdata) === in.hrdata)
 
       // In a perfect world, we'd use these signals
       val hresp = d_fail || (out.d.valid && (out.d.bits.denied || out.d.bits.corrupt))

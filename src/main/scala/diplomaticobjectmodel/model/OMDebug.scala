@@ -4,7 +4,7 @@ package freechips.rocketchip.diplomaticobjectmodel.model
 
 
 import freechips.rocketchip.config._
-import freechips.rocketchip.devices.debug.{DebugModuleParams, ExportDebug}
+import freechips.rocketchip.devices.debug.ExportDebug
 
 sealed trait OMDebugInterfaceType extends OMEnum
 case object JTAG extends OMDebugInterfaceType
@@ -56,6 +56,7 @@ case class OMDebug(
   hasAbstractPostIncrement: Boolean,
   hasAbstractPostExec: Boolean,
   hasClockGate: Boolean,
+  crossingHasSafeReset: Boolean,   // Do async crossings have "safe" reset logic
   _types: Seq[String] = Seq("OMDebug", "OMDevice", "OMComponent", "OMCompoundType")
 ) extends OMDevice
 

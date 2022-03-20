@@ -2,7 +2,8 @@
 
 package freechips.rocketchip.devices.tilelink
 
-import Chisel._
+import Chisel.{defaultCompileOptions => _, _}
+import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
 import Chisel.ImplicitConversions._
 import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.subsystem._
@@ -11,7 +12,8 @@ import freechips.rocketchip.regmapper._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.interrupts._
 import freechips.rocketchip.util._
-import freechips.rocketchip.util.property._
+import freechips.rocketchip.util.property
+import freechips.rocketchip.prci.{ClockSinkDomain}
 import chisel3.internal.sourceinfo.SourceInfo
 import freechips.rocketchip.diplomaticobjectmodel.model._
 
@@ -69,7 +71,7 @@ case class PLICParams(baseAddress: BigInt = 0xC000000, maxPriorities: Int = 7, i
 case object PLICKey extends Field[Option[PLICParams]](None)
 
 case class PLICAttachParams(
-  slaveWhere: BaseSubsystemBusAttachment = CBUS
+  slaveWhere: TLBusWrapperLocation = CBUS
 )
 
 case object PLICAttachKey extends Field(PLICAttachParams())
@@ -159,11 +161,11 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     val prioBits = log2Ceil(nPriorities+1)
     val priority =
       if (nPriorities > 0) Reg(Vec(nDevices, UInt(width=prioBits)))
-      else Wire(init=Vec.fill(nDevices)(UInt(1)))
+      else Wire(init=Vec.fill(nDevices max 1)(UInt(1)))
     val threshold =
       if (nPriorities > 0) Reg(Vec(nHarts, UInt(width=prioBits)))
       else Wire(init=Vec.fill(nHarts)(UInt(0)))
-    val pending = Reg(init=Vec.fill(nDevices){Bool(false)})
+    val pending = Reg(init=Vec.fill(nDevices max 1){Bool(false)})
 
     /* Construct the enable registers, chunked into 8-bit segments to reduce verilog size */
     val firstEnable = nDevices min 7
@@ -186,12 +188,17 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       harts(hart)   := ShiftRegister(Reg(next = fanin.io.max) > threshold(hart), params.intStages)
     }
 
+    // Priority registers are 32-bit aligned so treat each as its own group.
+    // Otherwise, the off-by-one nature of the priority registers gets confusing.
+    require(PLICConsts.priorityBytes == 4,
+      s"PLIC Priority register descriptions assume 32-bits per priority, not ${PLICConsts.priorityBytes}")
+
     def priorityRegDesc(i: Int) =
       RegFieldDesc(
         name      = s"priority_$i",
         desc      = s"Acting priority of interrupt source $i",
-        group     = Some("priority"),
-        groupDesc = Some("Acting priorities of each interrupt source."),
+        group     = Some(s"priority_${i}"),
+        groupDesc = Some(s"Acting priority of interrupt source ${i}"),
         reset     = if (nPriorities > 0) None else Some(1))
 
     def pendingRegDesc(i: Int) =
@@ -220,7 +227,8 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
       }
 
     val priorityRegFields = priority.zipWithIndex.map { case (p, i) =>
-      PLICConsts.priorityBase+4*(i+1) -> Seq(priorityRegField(p, i+1)) }
+      PLICConsts.priorityBase+PLICConsts.priorityBytes*(i+1) ->
+      Seq(priorityRegField(p, i+1)) }
     val pendingRegFields = Seq(PLICConsts.pendingBase ->
       (RegField(1) +: pending.zipWithIndex.map { case (b, i) => RegField.r(1, b, pendingRegDesc(i+1))}))
     val enableRegFields = enables.zipWithIndex.map { case (e, i) =>
@@ -303,13 +311,13 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     if (nDevices >= 2) {
       val claimed = claimer(0) && maxDevs(0) > 0
       val completed = completer(0)
-      cover(claimed && RegEnable(claimed, false.B, claimed || completed), "TWO_CLAIMS", "two claims with no intervening complete")
-      cover(completed && RegEnable(completed, false.B, claimed || completed), "TWO_COMPLETES", "two completes with no intervening claim")
+      property.cover(claimed && RegEnable(claimed, false.B, claimed || completed), "TWO_CLAIMS", "two claims with no intervening complete")
+      property.cover(completed && RegEnable(completed, false.B, claimed || completed), "TWO_COMPLETES", "two completes with no intervening claim")
 
       val ep = enables(0).asUInt & pending.asUInt
       val ep2 = RegNext(ep)
       val diff = ep & ~ep2
-      cover((diff & (diff - 1)) =/= 0, "TWO_INTS_PENDING", "two enabled interrupts became pending on same cycle")
+      property.cover((diff & (diff - 1)) =/= 0, "TWO_INTS_PENDING", "two enabled interrupts became pending on same cycle")
 
       if (nPriorities > 0)
         ccover(maxDevs(0) > (UInt(1) << priority(0).getWidth) && maxDevs(0) <= Cat(UInt(1), threshold(0)),
@@ -317,7 +325,7 @@ class TLPLIC(params: PLICParams, beatBytes: Int)(implicit p: Parameters) extends
     }
 
     def ccover(cond: Bool, label: String, desc: String)(implicit sourceInfo: SourceInfo) =
-      cover(cond, s"PLIC_$label", "Interrupts;;" + desc)
+      property.cover(cond, s"PLIC_$label", "Interrupts;;" + desc)
   }
 }
 
@@ -347,10 +355,14 @@ class PLICFanIn(nDevices: Int, prioBits: Int) extends Module {
 /** Trait that will connect a PLIC to a subsystem */
 trait CanHavePeripheryPLIC { this: BaseSubsystem =>
   val plicOpt  = p(PLICKey).map { params =>
-    val tlbus = attach(p(PLICAttachKey).slaveWhere)
-    val plic = LazyModule(new TLPLIC(params, tlbus.beatBytes))
+    val tlbus = locateTLBusWrapper(p(PLICAttachKey).slaveWhere)
+    val plicDomainWrapper = LazyModule(new ClockSinkDomain(take = None))
+    plicDomainWrapper.clockNode := tlbus.fixedClockNode
+
+    val plic = plicDomainWrapper { LazyModule(new TLPLIC(params, tlbus.beatBytes)) }
     plic.node := tlbus.coupleTo("plic") { TLFragmenter(tlbus) := _ }
     plic.intnode :=* ibus.toPLIC
+
     plic
   }
 }

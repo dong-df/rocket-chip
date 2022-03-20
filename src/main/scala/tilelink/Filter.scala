@@ -5,25 +5,24 @@ package freechips.rocketchip.tilelink
 import Chisel._
 import freechips.rocketchip.config.Parameters
 import freechips.rocketchip.diplomacy._
-import scala.math.{min,max}
 
 class TLFilter(
   mfilter: TLFilter.ManagerFilter = TLFilter.mIdentity,
   cfilter: TLFilter.ClientFilter  = TLFilter.cIdentity
   )(implicit p: Parameters) extends LazyModule
 {
-  val node = TLAdapterNode(
-    clientFn  = { cp => cp.copy(clients = cp.clients.flatMap { c =>
+  val node = new TLAdapterNode(
+    clientFn  = { cp => cp.v1copy(clients = cp.clients.flatMap { c =>
       val out = cfilter(c)
       out.map { o => // Confirm the filter only REMOVES capability
         require (c.sourceId.contains(o.sourceId))
-        require (c.supportsProbe.contains(o.supportsProbe))
-        require (c.supportsArithmetic.contains(o.supportsArithmetic))
-        require (c.supportsLogical.contains(o.supportsLogical))
-        require (c.supportsGet.contains(o.supportsGet))
-        require (c.supportsPutFull.contains(o.supportsPutFull))
-        require (c.supportsPutPartial.contains(o.supportsPutPartial))
-        require (c.supportsHint.contains(o.supportsHint))
+        require (c.supports.probe.contains(o.supports.probe))
+        require (c.supports.arithmetic.contains(o.supports.arithmetic))
+        require (c.supports.logical.contains(o.supports.logical))
+        require (c.supports.get.contains(o.supports.get))
+        require (c.supports.putFull.contains(o.supports.putFull))
+        require (c.supports.putPartial.contains(o.supports.putPartial))
+        require (c.supports.hint.contains(o.supports.hint))
         require (!c.requestFifo || o.requestFifo)
       }
       out
@@ -47,9 +46,12 @@ class TLFilter(
         }
         out
       }
-      mp.copy(managers = managers,
+      mp.v1copy(managers = managers,
               endSinkId = if (managers.exists(_.supportsAcquireB)) mp.endSinkId else 0)
-    })
+    }
+  ) {
+    override def circuitIdentity = true
+  }
 
   lazy val module = new LazyModuleImp(this) {
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
@@ -70,8 +72,8 @@ class TLFilter(
 
 object TLFilter
 {
-  type ManagerFilter = TLManagerParameters => Option[TLManagerParameters]
-  type ClientFilter = TLClientParameters => Option[TLClientParameters]
+  type ManagerFilter = TLSlaveParameters => Option[TLSlaveParameters]
+  type ClientFilter = TLMasterParameters => Option[TLMasterParameters]
 
   // preserve manager visibility
   def mIdentity: ManagerFilter = { m => Some(m) }
@@ -93,12 +95,12 @@ object TLFilter
   }
 
   // adjust supported transfer sizes based on filtered intersection
-  private def transferSizeHelper(m: TLManagerParameters, filtered: Seq[AddressSet], alignment: BigInt): Option[TLManagerParameters] = {
+  private def transferSizeHelper(m: TLSlaveParameters, filtered: Seq[AddressSet], alignment: BigInt): Option[TLSlaveParameters] = {
     val maxTransfer = 1 << 30
     val capTransfer = if (alignment == 0 || alignment > maxTransfer) maxTransfer else alignment.toInt
     val cap = TransferSizes(1, capTransfer)
     if (filtered.isEmpty) { None } else {
-      Some(m.copy(
+      Some(m.v1copy(
         address            = filtered,
         supportsAcquireT   = m.supportsAcquireT  .intersect(cap),
         supportsAcquireB   = m.supportsAcquireB  .intersect(cap),
@@ -114,7 +116,7 @@ object TLFilter
   // hide any fully contained address sets
   def mHideContained(containedBy: AddressSet): ManagerFilter = { m =>
     val filtered = m.address.filterNot(containedBy.contains(_))
-    if (filtered.isEmpty) None else Some(m.copy(address = filtered))
+    if (filtered.isEmpty) None else Some(m.v1copy(address = filtered))
   }
   // hide all cacheable managers
   def mHideCacheable: ManagerFilter = { m =>
@@ -127,7 +129,7 @@ object TLFilter
   // cacheable managers cannot be acquired from
   def mMaskCacheable: ManagerFilter = { m =>
     if (m.supportsAcquireB) {
-      Some(m.copy(
+      Some(m.v1copy(
         regionType       = RegionType.UNCACHED,
         supportsAcquireB = TransferSizes.none,
         supportsAcquireT = TransferSizes.none,
@@ -137,7 +139,7 @@ object TLFilter
   // only cacheable managers are visible, but cannot be acquired from
   def mSelectAndMaskCacheable: ManagerFilter = { m =>
     if (m.supportsAcquireB) {
-      Some(m.copy(
+      Some(m.v1copy(
         regionType       = RegionType.UNCACHED,
         supportsAcquireB = TransferSizes.none,
         supportsAcquireT = TransferSizes.none,
@@ -146,11 +148,11 @@ object TLFilter
   }
   // hide all caching clients
   def cHideCaching: ClientFilter = { c =>
-    if (c.supportsProbe) None else Some(c)
+    if (c.supports.probe) None else Some(c)
   }
   // onyl caching clients are visible
   def cSelectCaching: ClientFilter = { c =>
-    if (c.supportsProbe) Some(c) else None
+    if (c.supports.probe) Some(c) else None
   }
 
   // default application applies neither type of filter unless overridden

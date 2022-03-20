@@ -95,18 +95,18 @@ class TLFuzzer(
     require(n > 0, s"nOrdered must be > 0, not $n")
     require((inFlight % n) == 0, s"inFlight (${inFlight}) must be evenly divisible by nOrdered (${nOrdered}).")
     Seq.tabulate(n) {i =>
-      TLClientParameters(name =s"OrderedFuzzer$i",
+      TLMasterParameters.v1(name =s"OrderedFuzzer$i",
         sourceId = IdRange(i * (inFlight/n),  (i + 1)*(inFlight/n)),
         requestFifo = true)
     }
   } else {
-    Seq(TLClientParameters(
+    Seq(TLMasterParameters.v1(
       name = "Fuzzer",
       sourceId = IdRange(0,inFlight)
     ))
   }
 
-  val node = TLClientNode(Seq(TLClientPortParameters(clientParams)))
+  val node = TLClientNode(Seq(TLMasterPortParameters.v1(clientParams)))
 
   lazy val module = new LazyModuleImp(this) {
     val io = IO(new Bundle {
@@ -249,7 +249,7 @@ class TLFuzzRAM(txns: Int)(implicit p: Parameters) extends LazyModule
   val model = LazyModule(new TLRAMModel("TLFuzzRAM"))
   val ram  = LazyModule(new TLRAM(AddressSet(0x800, 0x7ff)))
   val ram2 = LazyModule(new TLRAM(AddressSet(0, 0x3ff), beatBytes = 16))
-  val gpio = LazyModule(new RRTest1(0x400))
+  val gpio = LazyModule(new TLRRTest1(0x400))
   val xbar = LazyModule(new TLXbar)
   val xbar2= LazyModule(new TLXbar)
   val fuzz = LazyModule(new TLFuzzer(txns))
