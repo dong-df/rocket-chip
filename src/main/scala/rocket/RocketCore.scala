@@ -6,7 +6,7 @@ package freechips.rocketchip.rocket
 import chisel3._
 import chisel3.util._
 import chisel3.withClock
-import freechips.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property
@@ -456,7 +456,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     zkn.io.fn   := ex_ctrl.alu_fn
     zkn.io.hl   := ex_reg_inst(27)
     zkn.io.bs   := ex_reg_inst(31,30)
-    zkn.io.rnum := ex_reg_inst(23,20)
     zkn.io.rs1  := ex_op1.asUInt
     zkn.io.rs2  := ex_op2.asUInt
     zkn.io.rd

@@ -6,7 +6,7 @@ package freechips.rocketchip.rocket
 import chisel3._
 import chisel3.util._
 
-import freechips.rocketchip.config.{Field, Parameters}
+import org.chipsalliance.cde.config.{Field, Parameters}
 import freechips.rocketchip.subsystem.CacheBlockBytes
 import freechips.rocketchip.diplomacy.RegionType
 import freechips.rocketchip.tile.{CoreModule, CoreBundle}
@@ -59,11 +59,10 @@ class TLBReq(lgMaxSize: Int)(implicit p: Parameters) extends CoreBundle()(p) {
 
 }
 
-class TLBExceptions(implicit p: Parameters) extends CoreBundle()(p) {
+class TLBExceptions extends Bundle {
   val ld = Bool()
   val st = Bool()
   val inst = Bool()
-  val v = Bool()
 }
 
 class TLBResp(implicit p: Parameters) extends CoreBundle()(p) {

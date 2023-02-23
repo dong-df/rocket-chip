@@ -4,9 +4,10 @@ package freechips.rocketchip.amba.axi4
 
 import Chisel.{defaultCompileOptions => _, _}
 import freechips.rocketchip.util.CompileOptions.NotStrictInferReset
-import freechips.rocketchip.config.Parameters
+import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
+import freechips.rocketchip.util.EnhancedChisel3Assign
 
 /** This adapter prunes all user bit fields of the echo type from request messages,
   * storing them in queues and echoing them back when matching response messages are received.
