@@ -64,7 +64,7 @@ case class RocketCoreParams(
   val instBits: Int = if (useCompressed) 16 else 32
   val lrscCycles: Int = 80 // worst case is 14 mispredicted branches + slop
   val traceHasWdata: Boolean = false // ooo wb, so no wdata in trace
-  override val customIsaExt = Some("Xrocket") // CEASE instruction
+  override val customIsaExt = Some("xrocket") // CEASE instruction
   override def minFLen: Int = fpu.map(_.minFLen).getOrElse(32)
   override def customCSRs(implicit p: Parameters) = new RocketCustomCSRs
 }
@@ -1092,9 +1092,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   def encodeVirtualAddress(a0: UInt, ea: UInt) = if (vaddrBitsExtended == vaddrBits) ea else {
     // efficient means to compress 64-bit VA into vaddrBits+1 bits
     // (VA is bad if VA(vaddrBits) != VA(vaddrBits-1))
-    val a = a0.asSInt >> vaddrBits
-    val msb = Mux(a === 0.S || a === -1.S, ea(vaddrBits), !ea(vaddrBits-1))
-    Cat(msb, ea(vaddrBits-1,0))
+    val b = vaddrBitsExtended-1
+    val a = (a0 >> b).asSInt
+    val msb = Mux(a === 0.S || a === -1.S, ea(b), !ea(b-1))
+    Cat(msb, ea(b-1, 0))
   }
 
   class Scoreboard(n: Int, zero: Boolean = false)
