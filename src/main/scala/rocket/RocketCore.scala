@@ -11,6 +11,7 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.util._
 import freechips.rocketchip.util.property
 import scala.collection.mutable.ArrayBuffer
+import freechips.rocketchip.trace._
 
 case class RocketCoreParams(
   xLen: Int = 64,
@@ -56,7 +57,8 @@ case class RocketCoreParams(
   debugROB: Option[DebugROBParams] = None, // if size < 1, SW ROB, else HW ROB
   haveCease: Boolean = true, // non-standard CEASE instruction
   haveSimTimeout: Boolean = true, // add plusarg for simulation timeout
-  vector: Option[RocketCoreVectorParams] = None
+  vector: Option[RocketCoreVectorParams] = None,
+  enableTraceCoreIngress: Boolean = false
 ) extends CoreParams {
   val lgPauseCycles = 5
   val haveFSDirty = false
@@ -131,6 +133,8 @@ class CoreInterrupts(val hasBeu: Boolean)(implicit p: Parameters) extends TileIn
 trait HasRocketCoreIO extends HasRocketCoreParameters {
   implicit val p: Parameters
   def nTotalRoCCCSRs: Int
+  def traceIngressParams = TraceCoreParams(nGroups = 1, iretireWidth = coreParams.retireWidth, 
+                                            xlen = coreParams.xLen, iaddrWidth = coreParams.xLen) 
   val io = IO(new CoreBundle()(p) {
     val hartid = Input(UInt(hartIdLen.W))
     val reset_vector = Input(UInt(resetVectorLen.W))
@@ -146,6 +150,7 @@ trait HasRocketCoreIO extends HasRocketCoreParameters {
     val wfi = Output(Bool())
     val traceStall = Input(Bool())
     val vector = if (usingVector) Some(Flipped(new VectorCoreIO)) else None
+    val trace_core_ingress = if (rocketParams.enableTraceCoreIngress) Some(Output(new TraceCoreInterface(traceIngressParams))) else None
   })
 }
 
@@ -301,6 +306,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val wb_reg_raw_inst = Reg(UInt())
   val wb_reg_wdata = Reg(Bits())
   val wb_reg_rs2 = Reg(Bits())
+  val wb_reg_br_taken = Reg(Bool())
   val take_pc_wb = Wire(Bool())
   val wb_reg_wphit           = Reg(Vec(nBreakpoints, Bool()))
 
@@ -351,6 +357,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     val v_decode = rocketParams.vector.get.decoder(p)
     v_decode.io.inst := id_inst(0)
     v_decode.io.vconfig := csr.io.vector.get.vconfig
+    id_ctrl.vec := v_decode.io.vector
     when (v_decode.io.legal) {
       id_ctrl.legal := !csr.io.vector.get.vconfig.vtype.vill
       id_ctrl.fp := v_decode.io.fp
@@ -382,7 +389,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     (id_ctrl.mul || id_ctrl.div) && !csr.io.status.isa('m'-'a') ||
     id_ctrl.amo && !csr.io.status.isa('a'-'a') ||
     id_ctrl.fp && (csr.io.decode(0).fp_illegal || (io.fpu.illegal_rm && !id_ctrl.vec)) ||
-    (id_ctrl.vec) && (csr.io.decode(0).vector_illegal || csr.io.vector.map(_.vconfig.vtype.vill).getOrElse(false.B)) ||
+    id_set_vconfig && csr.io.decode(0).vector_illegal ||
+    id_ctrl.vec && (csr.io.decode(0).vector_illegal || csr.io.vector.map(_.vconfig.vtype.vill).getOrElse(false.B)) ||
     id_ctrl.dp && !csr.io.status.isa('d'-'a') ||
     ibuf.io.inst(0).bits.rvc && !csr.io.status.isa('c'-'a') ||
     id_raddr2_illegal && id_ctrl.rxs2 ||
@@ -721,6 +729,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     wb_reg_hfence_v := mem_ctrl.mem_cmd === M_HFENCEV
     wb_reg_hfence_g := mem_ctrl.mem_cmd === M_HFENCEG
     wb_reg_pc := mem_reg_pc
+    wb_reg_br_taken := mem_br_taken
     wb_reg_wphit := mem_reg_wphit | bpu.io.bpwatch.map { bpw => (bpw.rvalid(0) && mem_reg_load) || (bpw.wvalid(0) && mem_reg_store) }
     wb_reg_set_vconfig := mem_reg_set_vconfig
   }
@@ -822,6 +831,27 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
                  Mux(wb_ctrl.mul, mul.map(_.io.resp.bits.data).getOrElse(wb_reg_wdata),
                  wb_reg_wdata))))
   when (rf_wen) { rf.write(rf_waddr, rf_wdata) }
+
+  if (rocketParams.enableTraceCoreIngress) {
+    val trace_ingress = Module(new TraceCoreIngress(traceIngressParams))
+    trace_ingress.io.in.valid := wb_valid || wb_xcpt
+    trace_ingress.io.in.taken := wb_reg_br_taken
+    trace_ingress.io.in.is_branch := wb_ctrl.branch
+    trace_ingress.io.in.is_jal := wb_ctrl.jal
+    trace_ingress.io.in.is_jalr := wb_ctrl.jalr
+    trace_ingress.io.in.insn := wb_reg_inst
+    trace_ingress.io.in.pc := wb_reg_pc
+    trace_ingress.io.in.is_compressed := !wb_reg_raw_inst(1, 0).andR // 2'b11 is uncompressed, everything else is compressed
+    trace_ingress.io.in.interrupt := csr.io.trace(0).interrupt && csr.io.trace(0).exception
+    trace_ingress.io.in.exception := !csr.io.trace(0).interrupt && csr.io.trace(0).exception
+    trace_ingress.io.in.trap_return := csr.io.trap_return
+
+    io.trace_core_ingress.get.group(0) <> trace_ingress.io.out
+    io.trace_core_ingress.get.priv := csr.io.trace(0).priv 
+    io.trace_core_ingress.get.tval := csr.io.tval
+    io.trace_core_ingress.get.cause := csr.io.cause
+    io.trace_core_ingress.get.time := csr.io.time
+  }
 
   // hook up control/status regfile
   csr.io.ungated_clock := clock
@@ -1093,7 +1123,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   io.fpu.valid := !ctrl_killd && id_ctrl.fp
   io.fpu.killx := ctrl_killx
-  io.fpu.killm := killm_common
+  io.fpu.killm := killm_common || vec_kill_mem
   io.fpu.inst := id_inst(0)
   io.fpu.fromint_data := ex_rs(0)
   io.fpu.ll_resp_val := dmem_resp_valid && dmem_resp_fpu
@@ -1122,7 +1152,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     v.ex.rs2 := ex_rs(1)
     v.ex.pc := ex_reg_pc
     v.mem.frs1 := io.fpu.store_data
-    v.killm := killm_common
+    v.killm := killm_common || fpu_kill_mem
     v.status := csr.io.status
   }
 
